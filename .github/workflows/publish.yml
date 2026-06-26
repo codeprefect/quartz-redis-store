@@ -7,20 +7,27 @@ jobs:
   publish:
     name: build, pack & publish
     runs-on: ubuntu-latest
+    environment: release
 
     steps:
     - uses: actions/checkout@v3
     - name: Setup .NET
       uses: actions/setup-dotnet@v3
       with:
-        dotnet-version: 6.0.x
+        dotnet-version: 10.0.x
     - name: Create NuGet Package
-      run: dotnet pack -c Release /p:Version=${{ github.ref_name }} /p:PackageReleaseNotes="See https://github.com/joaoantoniomartinsfilho/quartz-redis-store/releases/tag/${{ github.event.release.tag_name }}"
+      run: dotnet pack -c Release /p:Version=${{ github.ref_name }} /p:PackageReleaseNotes="See https://github.com/codeprefect/quartz-redis-store/releases/tag/${{ github.event.release.tag_name }}"
       working-directory: ./src      
     - name: Archive NuGet Package
       uses: actions/upload-artifact@v4
       with:
-        name: QuartzRedis.Store
+        name: CodEaisy.QuartzRedis.Store
         path: ./src/QuartzRedis.Store/bin/Release/QuartzRedis.Store.${{ github.ref_name }}.nupkg   
+    - name: NuGet login (OIDC → temp API key)
+      uses: NuGet/login@v1
+      id: login
+      with:
+        user: barakimam # Recommended: use a secret like ${{ secrets.NUGET_USER }} for your nuget.org username (profile name), NOT your email address
+    
     - name: Publish Nuget Package
-      run: dotnet nuget push **/*.nupkg --api-key ${{ secrets.nuget_api_key }} --source https://api.nuget.org/v3/index.json --no-symbols true
+      run: dotnet nuget push **/*.nupkg --api-key ${{steps.login.outputs.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json --no-symbols true
