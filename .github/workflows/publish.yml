@@ -8,6 +8,9 @@ jobs:
     name: build, pack & publish
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v3
@@ -22,7 +25,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: CodEaisy.QuartzRedis.Store
-        path: ./src/QuartzRedis.Store/bin/Release/QuartzRedis.Store.${{ github.ref_name }}.nupkg   
+        path: ./src/QuartzRedis.Store/bin/Release/CodEaisy.QuartzRedis.Store.${{ github.ref_name }}.nupkg   
     - name: NuGet login (OIDC → temp API key)
       uses: NuGet/login@v1
       id: login
