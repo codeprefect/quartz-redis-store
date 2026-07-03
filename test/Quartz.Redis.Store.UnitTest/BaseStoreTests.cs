@@ -9,7 +9,7 @@ namespace Quartz.Redis.Store.UnitTest
         {
             var properties = new NameValueCollection
             {
-                ["quartz.jobStore.type"] = "Quartz.Redis.Store.RedisJobStore, Quartz.Redis.Store.JobStore",
+                ["quartz.jobStore.type"] = "QuartzRedis.Store.RedisJobStore, QuartzRedis.Store",
                 ["quartz.jobStore.keyPrefix"] = "UnitJob",
                 ["quartz.serializer.type"] = "json",
                 ["quartz.scheduler.instanceId"] = "AUTO",

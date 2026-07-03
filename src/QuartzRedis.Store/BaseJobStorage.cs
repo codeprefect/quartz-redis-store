@@ -52,11 +52,6 @@ namespace QuartzRedis.Store
         protected int TriggerLockTimeout;
 
         /// <summary>
-        /// lockValue
-        /// </summary>
-        protected string LockValue;
-
-        /// <summary>
         /// redis lock time out in milliseconds.
         /// </summary>
         protected int RedisLockTimeout;
@@ -89,7 +84,6 @@ namespace QuartzRedis.Store
             _logger = LogManager.GetLogger(GetType());
             TriggerLockTimeout = triggerLockTimeout;
             RedisLockTimeout = redisLockTimeout;
-            LockValue = "RedisLock";
         }
 
 
@@ -437,20 +431,48 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// Release triggers currently held by schedulers which have ceased to function e.g. crashed
+        /// Release triggers currently held by schedulers which have ceased to function e.g. crashed.
         /// </summary>
-        protected void ReleaseTriggers()
+        /// <remarks>
+        /// This uses its own dedicated lock (<see cref="RedisJobStoreSchema.OrphanCleanupLockKey"/>), separate
+        /// from the main store lock, and takes it non-blockingly. That way orphaned-trigger cleanup can never be
+        /// starved by unrelated store traffic contending for the main lock - it either runs on schedule or is
+        /// already being run by another concurrent caller/instance, in which case this call is a no-op.
+        /// </remarks>
+        public void ReleaseTriggers()
         {
             double misfireTime = DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds();
-            if (misfireTime - GetLastTriggersReleaseTime() > TriggerLockTimeout)
+            if (misfireTime - GetLastTriggersReleaseTime() <= TriggerLockTimeout)
             {
-                // it has been more than triggerLockTimeout minutes since we last released orphaned triggers
+                return;
+            }
+
+            var cleanupLockValue = Guid.NewGuid().ToString();
+            if (!Db.LockTake(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue, TimeSpan.FromMilliseconds(RedisLockTimeout)))
+            {
+                // another caller/instance is already sweeping for orphaned triggers - nothing to do here.
+                return;
+            }
+
+            try
+            {
+                // re-check under the lock in case another caller just finished the sweep.
+                misfireTime = DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds();
+                if (misfireTime - GetLastTriggersReleaseTime() <= TriggerLockTimeout)
+                {
+                    return;
+                }
+
+                // it has been more than triggerLockTimeout milliseconds since we last released orphaned triggers
                 ReleaseOrphanedTriggers(RedisTriggerState.Acquired, RedisTriggerState.Waiting);
                 ReleaseOrphanedTriggers(RedisTriggerState.Blocked, RedisTriggerState.Waiting);
                 ReleaseOrphanedTriggers(RedisTriggerState.PausedBlocked, RedisTriggerState.Paused);
                 SetLastTriggerReleaseTime(DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds());
             }
-
+            finally
+            {
+                Db.LockRelease(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue);
+            }
         }
 
         /// <summary>
@@ -470,9 +492,16 @@ namespace QuartzRedis.Store
 
             bool retry = false;
 
+            // A burst of misfired triggers would otherwise restart this scan indefinitely while holding the
+            // trigger-acquisition lock, blocking every other caller of AcquireNextTriggers/ReleaseAcquiredTrigger
+            // for an unbounded time. Cap the retries and let the scheduler simply call again on its next poll.
+            const int maxMisfireRetries = 10;
+            var attempt = 0;
+
             do
             {
                 retry = false;
+                attempt++;
 
                 var acquiredJobHashKeysForNoConcurrentExec = new global::System.Collections.Generic.HashSet<string>();
 
@@ -526,7 +555,7 @@ namespace QuartzRedis.Store
 
 
 
-            } while (retry);
+            } while (retry && attempt < maxMisfireRetries);
 
 
             return triggers;
@@ -1199,28 +1228,39 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// try to acquire a redis lock.
+        /// try to acquire a named redis lock.
         /// </summary>
+        /// <param name="lockKey">the redis key backing this lock.</param>
+        /// <param name="lockValue">the token to use for this lock attempt, returned to the caller if the lock is acquired so it can later be passed to <see cref="Unlock"/>.</param>
         /// <returns>locked or not</returns>
-        private bool Lock()
+        private bool Lock(string lockKey, out string lockValue)
         {
             var guid = Guid.NewGuid().ToString();
 
-            var lockacquired = Db.LockTake(RedisJobStoreSchema.LockKey, guid, TimeSpan.FromMilliseconds(RedisLockTimeout));
-            if (lockacquired)
-            {
-                LockValue = guid;
-            }
-            return lockacquired;
+            var lockAcquired = Db.LockTake(lockKey, guid, TimeSpan.FromMilliseconds(RedisLockTimeout));
+            lockValue = lockAcquired ? guid : null;
+            return lockAcquired;
         }
 
         /// <summary>
-        /// try to acquire a lock with retry
-        /// if acquire fails, then retry till it succeeds.
+        /// try to acquire the main store lock, with retry - if acquire fails, then retry till it succeeds.
         /// </summary>
-        public void LockWithWait()
+        /// <returns>the token that must be passed to <see cref="Unlock(string)"/> to release this lock.</returns>
+        public string LockWithWait()
         {
-            while (!Lock())
+            return LockWithWait(RedisJobStoreSchema.LockKey);
+        }
+
+        /// <summary>
+        /// try to acquire the named lock, with retry - if acquire fails, then retry till it succeeds.
+        /// </summary>
+        /// <param name="lockKey">the redis key backing this lock - use a dedicated key per independent
+        /// critical section so unrelated operations don't contend with each other for the same lock.</param>
+        /// <returns>the token that must be passed to <see cref="Unlock(string, string)"/> to release this lock.</returns>
+        public string LockWithWait(string lockKey)
+        {
+            string lockValue;
+            while (!Lock(lockKey, out lockValue))
             {
                 try
                 {
@@ -1233,6 +1273,27 @@ namespace QuartzRedis.Store
                 }
             }
 
+            return lockValue;
+        }
+
+        /// <summary>
+        /// async counterpart to <see cref="LockWithWait(string)"/> - waits for the named lock without blocking
+        /// a thread-pool thread for the whole contention period (uses <see cref="Task.Delay(int)"/> instead of
+        /// <see cref="Thread.Sleep(int)"/> between retries). Use this for lock-critical paths that can be
+        /// contended under load, such as trigger acquisition.
+        /// </summary>
+        /// <param name="lockKey">the redis key backing this lock.</param>
+        /// <returns>the token that must be passed to <see cref="Unlock(string, string)"/> to release this lock.</returns>
+        public async Task<string> LockWithWaitAsync(string lockKey)
+        {
+            string lockValue;
+            while (!Lock(lockKey, out lockValue))
+            {
+                _logger.Info("waiting for redis lock");
+                await Task.Delay(RandomInt(75, 125)).ConfigureAwait(false);
+            }
+
+            return lockValue;
         }
 
         /// <summary>
@@ -1249,14 +1310,24 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// release the redis lock. 
+        /// release the main store lock.
         /// </summary>
+        /// <param name="lockValue">the token returned by the matching <see cref="LockWithWait()"/> call.</param>
         /// <returns>unlock succeeds or not</returns>
-        public bool Unlock()
+        public bool Unlock(string lockValue)
         {
-            var key = RedisJobStoreSchema.LockKey;
+            return Unlock(RedisJobStoreSchema.LockKey, lockValue);
+        }
 
-            return Db.LockRelease(key, LockValue);
+        /// <summary>
+        /// release a named lock.
+        /// </summary>
+        /// <param name="lockKey">the redis key backing this lock.</param>
+        /// <param name="lockValue">the token returned by the matching <see cref="LockWithWait(string)"/> call.</param>
+        /// <returns>unlock succeeds or not</returns>
+        public bool Unlock(string lockKey, string lockValue)
+        {
+            return Db.LockRelease(lockKey, lockValue);
         }
 
         /// <summary>

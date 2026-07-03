@@ -542,7 +542,7 @@ namespace QuartzRedis.Store
             }
             else
             {
-                foreach (var triggerGroupSetKy in Db.SetMembersAsync(RedisJobStoreSchema.TriggerGroupsSetKey()).Result)
+                foreach (var triggerGroupSetKy in Db.SetMembers(RedisJobStoreSchema.TriggerGroupsSetKey()))
                 {
                     if (matcher.CompareWithOperator.Evaluate(RedisJobStoreSchema.TriggerGroup(triggerGroupSetKy),
                                                             matcher.CompareToValue))
@@ -787,9 +787,9 @@ namespace QuartzRedis.Store
                         else
                         {
                             score =
-                                this.Db.SortedSetScoreAsync(
+                                this.Db.SortedSetScore(
                                     this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
-                                    nonConcurrentTriggerHashKey).Result;
+                                    nonConcurrentTriggerHashKey);
 
                             if (score.HasValue)
                             {
@@ -839,9 +839,9 @@ namespace QuartzRedis.Store
                 {
                     var jobTriggersSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(jobDetail.Key);
 
-                    foreach (var errorTriggerHashKey in this.Db.SetMembersAsync(jobTriggersSetKey).Result)
+                    foreach (var errorTriggerHashKey in this.Db.SetMembers(jobTriggersSetKey))
                     {
-                        var nextFireTime = this.Db.HashGetAsync(errorTriggerHashKey.ToString(), RedisJobStoreSchema.NextFireTime).Result;
+                        var nextFireTime = this.Db.HashGet(errorTriggerHashKey.ToString(), RedisJobStoreSchema.NextFireTime);
                         var score = string.IsNullOrEmpty(nextFireTime) ? 0 : double.Parse(nextFireTime);
                         this.SetTriggerState(RedisTriggerState.Error, score, errorTriggerHashKey);
                     }
@@ -851,7 +851,7 @@ namespace QuartzRedis.Store
                 {
                     var jobTriggerSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(jobDetail.Key);
 
-                    foreach (var completedTriggerHashKey in this.Db.SetMembersAsync(jobTriggerSetKey).Result)
+                    foreach (var completedTriggerHashKey in this.Db.SetMembers(jobTriggerSetKey))
                     {
                         this.SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(),
                                              completedTriggerHashKey);
@@ -930,7 +930,7 @@ namespace QuartzRedis.Store
             }
             else
             {
-                var triggerGroupSets = this.Db.SetMembersAsync(this.RedisJobStoreSchema.TriggerGroupsSetKey()).Result;
+                var triggerGroupSets = this.Db.SetMembers(this.RedisJobStoreSchema.TriggerGroupsSetKey());
                 var triggerGroupsResult = (from groupSet in triggerGroupSets where matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.TriggerGroup(groupSet), matcher.CompareToValue) select Db.SetMembers(groupSet.ToString())).ToList();
 
                 foreach (var triggerHashKeys in triggerGroupsResult)

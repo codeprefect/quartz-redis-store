@@ -30,6 +30,12 @@ namespace QuartzRedis.Store
         /// </summary>
         private RedisStorage _storage;
 
+        /// <summary>
+        /// periodically sweeps for orphaned trigger locks, independent of the main store lock so that
+        /// cleanup can never be starved by unrelated store traffic (see <see cref="BaseJobStorage.ReleaseTriggers"/>).
+        /// </summary>
+        private Timer _orphanCleanupTimer;
+
         #endregion
 
         #region public properties
@@ -157,6 +163,22 @@ namespace QuartzRedis.Store
             }
 
             _storage = new RedisStorage(_storeSchema, _db, signaler, InstanceId, TriggerLockTimeout ?? 300000, RedisLockTimeout ?? 6000);
+
+            // sweep for orphaned trigger locks on a fixed cadence, independent of AcquireNextTriggers/the main
+            // store lock, so recovery cannot be starved by unrelated store traffic under load.
+            var cleanupInterval = TimeSpan.FromMilliseconds((TriggerLockTimeout ?? 300000) / 2.0);
+            _orphanCleanupTimer = new Timer(_ =>
+            {
+                try
+                {
+                    _storage.ReleaseTriggers();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("error while sweeping for orphaned trigger locks", ex);
+                }
+            }, null, cleanupInterval, cleanupInterval);
+
             return Task.CompletedTask;
         }
 
@@ -181,6 +203,7 @@ namespace QuartzRedis.Store
         public Task Shutdown(CancellationToken cancellationToken = default)
         {
             _logger.Debug("scheduler has shutdown");
+            _orphanCleanupTimer?.Dispose();
             _db.Multiplexer.Dispose();
             return Task.CompletedTask;
         }
@@ -199,14 +222,14 @@ namespace QuartzRedis.Store
         public Task<bool> IsJobGroupPaused(string groupName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("IsJobGroupPaused");
-            return Task.FromResult(DoWithLock(() => _storage.IsJobGroupPaused(groupName),
+            return Task.FromResult(WithoutLock(() => _storage.IsJobGroupPaused(groupName),
                               string.Format("Error on IsJobGroupPaused - Group {0}", groupName)));
         }
 
         public Task<bool> IsTriggerGroupPaused(string groupName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("IsTriggerGroupPaused");
-            return Task.FromResult(DoWithLock(() => _storage.IsTriggerGroupPaused(groupName),
+            return Task.FromResult(WithoutLock(() => _storage.IsTriggerGroupPaused(groupName),
                               string.Format("Error on IsTriggerGroupPaused - Group {0}", groupName)));
         }
 
@@ -262,7 +285,7 @@ namespace QuartzRedis.Store
         public Task<IJobDetail?> RetrieveJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RetrieveJob");
-            return Task.FromResult<IJobDetail?>(DoWithLock(() => _storage.RetrieveJob(jobKey),
+            return Task.FromResult<IJobDetail?>(WithoutLock(() => _storage.RetrieveJob(jobKey),
                               "Could not retriev job"));
         }
 
@@ -310,7 +333,7 @@ namespace QuartzRedis.Store
         {
             _logger.Debug("RetrieveTrigger");
 
-            return Task.FromResult<IOperableTrigger?>(DoWithLock(() => _storage.RetrieveTrigger(triggerKey),
+            return Task.FromResult<IOperableTrigger?>(WithoutLock(() => _storage.RetrieveTrigger(triggerKey),
                               "could not retrieve trigger"));
         }
 
@@ -318,21 +341,21 @@ namespace QuartzRedis.Store
         {
             _logger.Debug("CalendarExists");
 
-            return Task.FromResult(DoWithLock(() => _storage.CheckExists(calName),
+            return Task.FromResult(WithoutLock(() => _storage.CheckExists(calName),
                              string.Format("could not check if the calendar {0} exists", calName)));
         }
 
         public Task<bool> CheckExists(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("CheckExists - Job");
-            return Task.FromResult(DoWithLock(() => _storage.CheckExists(jobKey),
+            return Task.FromResult(WithoutLock(() => _storage.CheckExists(jobKey),
                               string.Format("could not check if the job {0} exists", jobKey)));
         }
 
         public Task<bool> CheckExists(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("CheckExists - Trigger");
-            return Task.FromResult(DoWithLock(() => _storage.CheckExists(triggerKey),
+            return Task.FromResult(WithoutLock(() => _storage.CheckExists(triggerKey),
                             string.Format("could not check if the trigger {0} exists", triggerKey)));
         }
 
@@ -361,68 +384,68 @@ namespace QuartzRedis.Store
         public Task<ICalendar?> RetrieveCalendar(string calName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RetrieveCalendar");
-            return Task.FromResult<ICalendar?>(DoWithLock(() => _storage.RetrieveCalendar(calName),
+            return Task.FromResult<ICalendar?>(WithoutLock(() => _storage.RetrieveCalendar(calName),
                 $"Error on retrieving calendar - {calName}"));
         }
 
         public Task<int> GetNumberOfJobs(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfJobs");
-            return Task.FromResult(DoWithLock(() => _storage.NumberOfJobs(), "Error on getting Number of jobs"));
+            return Task.FromResult(WithoutLock(() => _storage.NumberOfJobs(), "Error on getting Number of jobs"));
         }
 
         public Task<int> GetNumberOfTriggers(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfTriggers");
-            return Task.FromResult(DoWithLock(() => _storage.NumberOfTriggers(), "Error on getting number of triggers"));
+            return Task.FromResult(WithoutLock(() => _storage.NumberOfTriggers(), "Error on getting number of triggers"));
         }
 
         public Task<int> GetNumberOfCalendars(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfCalendars");
-            return Task.FromResult(DoWithLock(() => _storage.NumberOfCalendars(), "Error on getting number of calendars"));
+            return Task.FromResult(WithoutLock(() => _storage.NumberOfCalendars(), "Error on getting number of calendars"));
         }
 
         public Task<IReadOnlyCollection<JobKey>> GetJobKeys(GroupMatcher<JobKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetJobKeys");
-            return Task.FromResult(DoWithLock(() => _storage.JobKeys(matcher), "Error on getting job keys"));
+            return Task.FromResult(WithoutLock(() => _storage.JobKeys(matcher), "Error on getting job keys"));
         }
 
         public Task<IReadOnlyCollection<TriggerKey>> GetTriggerKeys(GroupMatcher<TriggerKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerKeys");
-            return Task.FromResult(DoWithLock(() => _storage.TriggerKeys(matcher), "Error on getting trigger keys"));
+            return Task.FromResult(WithoutLock(() => _storage.TriggerKeys(matcher), "Error on getting trigger keys"));
         }
 
         public Task<IReadOnlyCollection<string>> GetJobGroupNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetJobGroupNames");
-            return Task.FromResult(DoWithLock(() => _storage.JobGroupNames(), "Error on getting job group names"));
+            return Task.FromResult(WithoutLock(() => _storage.JobGroupNames(), "Error on getting job group names"));
         }
 
         public Task<IReadOnlyCollection<string>> GetTriggerGroupNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerGroupNames");
-            return Task.FromResult(DoWithLock(() => _storage.TriggerGroupNames(), "Error on getting trigger group names"));
+            return Task.FromResult(WithoutLock(() => _storage.TriggerGroupNames(), "Error on getting trigger group names"));
         }
 
         public Task<IReadOnlyCollection<string>> GetCalendarNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetCalendarNames");
-            return Task.FromResult(DoWithLock(() => _storage.CalendarNames(), "Error on getting calendar names"));
+            return Task.FromResult(WithoutLock(() => _storage.CalendarNames(), "Error on getting calendar names"));
         }
 
         public Task<IReadOnlyCollection<IOperableTrigger>> GetTriggersForJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggersForJob");
-            return Task.FromResult(DoWithLock(() => _storage.GetTriggersForJob(jobKey), string.Format("Error on getting triggers for job - {0}", jobKey)));
+            return Task.FromResult(WithoutLock(() => _storage.GetTriggersForJob(jobKey), string.Format("Error on getting triggers for job - {0}", jobKey)));
         }
 
         public Task<TriggerState> GetTriggerState(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerState");
-            return Task.FromResult(DoWithLock(() => _storage.GetTriggerState(triggerKey),
+            return Task.FromResult(WithoutLock(() => _storage.GetTriggerState(triggerKey),
                 $"Error on getting trigger state for trigger - {triggerKey}"));
         }
 
@@ -480,7 +503,7 @@ namespace QuartzRedis.Store
         public Task<IReadOnlyCollection<string>> GetPausedTriggerGroups(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetPausedTriggerGroups");
-            return Task.FromResult(DoWithLock(() => _storage.GetPausedTriggerGroups(), "Error on getting paused trigger groups"));
+            return Task.FromResult(WithoutLock(() => _storage.GetPausedTriggerGroups(), "Error on getting paused trigger groups"));
         }
 
         public Task ResumeJob(JobKey jobKey, CancellationToken cancellationToken = default)
@@ -510,18 +533,22 @@ namespace QuartzRedis.Store
             return Task.CompletedTask;
         }
 
-        public Task<IReadOnlyCollection<IOperableTrigger>> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow, CancellationToken cancellationToken = default)
+        public async Task<IReadOnlyCollection<IOperableTrigger>> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow, CancellationToken cancellationToken = default)
         {
             _logger.Debug("AcquireNextTriggers");
-            return Task.FromResult(DoWithLock(() => _storage.AcquireNextTriggers(noLaterThan, maxCount, timeWindow),
-                              "Error on acquiring next triggers"));
+            // uses a dedicated lock key (waited on without blocking a thread-pool thread, see
+            // DoWithLockAsync) so this can never be starved out by unrelated, high-frequency store writes
+            // (StoreJob, TriggeredJobComplete, ...) contending for the main store lock under load.
+            return await DoWithLockAsync(() => _storage.AcquireNextTriggers(noLaterThan, maxCount, timeWindow),
+                              "Error on acquiring next triggers", _storeSchema.AcquireTriggersLockKey).ConfigureAwait(false);
         }
 
-        public Task ReleaseAcquiredTrigger(IOperableTrigger trigger, CancellationToken cancellationToken = default)
+        public async Task ReleaseAcquiredTrigger(IOperableTrigger trigger, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ReleaseAcquiredTrigger");
-            DoWithLock(() => _storage.ReleaseAcquiredTrigger(trigger), string.Format("Error on releasing acquired trigger - {0}", trigger));
-            return Task.CompletedTask;
+            // shares AcquireNextTriggers' dedicated lock since both mutate the Acquired-state trigger set.
+            await DoWithLockAsync(() => { _storage.ReleaseAcquiredTrigger(trigger); return true; },
+                string.Format("Error on releasing acquired trigger - {0}", trigger), _storeSchema.AcquireTriggersLockKey).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -549,17 +576,46 @@ namespace QuartzRedis.Store
         #region private methods
 
         /// <summary>
-        /// crud opertion to redis with lock 
+        /// runs a pure read against redis with the same error-handling semantics as <see cref="DoWithLock{T}"/>,
+        /// but without taking the store lock - single-key Redis reads are already atomic and don't need
+        /// app-level mutual exclusion, so locking them only adds needless contention with concurrent writers.
         /// </summary>
         /// <typeparam name="T">return type of the Function</typeparam>
         /// <param name="fun">Fuction</param>
         /// <param name="errorMessage">error message used to override the default one</param>
         /// <returns></returns>
-        private T DoWithLock<T>(Func<T> fun, string errorMessage = "Job Storage error")
+        private T WithoutLock<T>(Func<T> fun, string errorMessage = "Job Storage error")
         {
             try
             {
-                _storage.LockWithWait();
+                return fun.Invoke();
+            }
+            catch (ObjectAlreadyExistsException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new JobPersistenceException(errorMessage, ex);
+            }
+        }
+
+        /// <summary>
+        /// crud opertion to redis with lock
+        /// </summary>
+        /// <typeparam name="T">return type of the Function</typeparam>
+        /// <param name="fun">Fuction</param>
+        /// <param name="errorMessage">error message used to override the default one</param>
+        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.
+        /// Pass a dedicated key for critical sections that must not be starved by unrelated store traffic
+        /// (e.g. trigger acquisition).</param>
+        /// <returns></returns>
+        private T DoWithLock<T>(Func<T> fun, string errorMessage = "Job Storage error", string lockKey = null)
+        {
+            string lockValue = null;
+            try
+            {
+                lockValue = lockKey == null ? _storage.LockWithWait() : _storage.LockWithWait(lockKey);
                 return fun.Invoke();
             }
             catch (ObjectAlreadyExistsException)
@@ -572,20 +628,60 @@ namespace QuartzRedis.Store
             }
             finally
             {
-                _storage.Unlock();
+                if (lockValue != null)
+                {
+                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
+                }
             }
         }
 
         /// <summary>
-        /// crud opertion to redis with lock 
+        /// async counterpart to <see cref="DoWithLock{T}"/> - waits for the lock via
+        /// <see cref="BaseJobStorage.LockWithWaitAsync"/> instead of the blocking, thread-pool-consuming
+        /// <see cref="BaseJobStorage.LockWithWait(string)"/>. Use for lock-critical sections that can be
+        /// contended under load (e.g. trigger acquisition), so waiting callers don't tie up worker threads.
+        /// </summary>
+        /// <typeparam name="T">return type of the Function</typeparam>
+        /// <param name="fun">Fuction</param>
+        /// <param name="errorMessage">error message used to override the default one</param>
+        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.</param>
+        private async Task<T> DoWithLockAsync<T>(Func<T> fun, string errorMessage = "Job Storage error", string lockKey = null)
+        {
+            string lockValue = null;
+            try
+            {
+                lockValue = await _storage.LockWithWaitAsync(lockKey ?? _storeSchema.LockKey).ConfigureAwait(false);
+                return fun.Invoke();
+            }
+            catch (ObjectAlreadyExistsException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new JobPersistenceException(errorMessage, ex);
+            }
+            finally
+            {
+                if (lockValue != null)
+                {
+                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
+                }
+            }
+        }
+
+        /// <summary>
+        /// crud opertion to redis with lock
         /// </summary>
         /// <param name="action">Action</param>
         /// <param name="errorMessage">error message used to override the default one</param>
-        private void DoWithLock(Action action, string errorMessage = "Job Storage error")
+        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.</param>
+        private void DoWithLock(Action action, string errorMessage = "Job Storage error", string lockKey = null)
         {
+            string lockValue = null;
             try
             {
-                _storage.LockWithWait();
+                lockValue = lockKey == null ? _storage.LockWithWait() : _storage.LockWithWait(lockKey);
                 action.Invoke();
             }
             catch (ObjectAlreadyExistsException ex)
@@ -598,7 +694,10 @@ namespace QuartzRedis.Store
             }
             finally
             {
-                _storage.Unlock();
+                if (lockValue != null)
+                {
+                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
+                }
             }
         }
 

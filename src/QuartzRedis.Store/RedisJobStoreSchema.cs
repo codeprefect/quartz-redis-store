@@ -454,13 +454,38 @@ namespace QuartzRedis.Store
 
 
         /// <summary>
-        /// get the lock key for redis. 
+        /// get the lock key for redis.
         /// </summary>
         public string LockKey
         {
             get
             {
                 return this.AddPrefix(DefaultLockName);
+            }
+        }
+
+        /// <summary>
+        /// dedicated lock key used to guard the orphaned-trigger cleanup sweep, kept separate from
+        /// <see cref="LockKey"/> so that cleanup can run even while the main store lock is contended.
+        /// </summary>
+        public string OrphanCleanupLockKey
+        {
+            get
+            {
+                return this.AddPrefix(DefaultLockName + "_orphan_cleanup");
+            }
+        }
+
+        /// <summary>
+        /// dedicated lock key used to guard trigger acquisition (<see cref="BaseJobStorage.AcquireNextTriggers"/>),
+        /// kept separate from <see cref="LockKey"/> so that high-frequency, unrelated store writes (e.g. job
+        /// storage, triggered-job-complete callbacks) can never starve the scheduler out of acquiring new triggers.
+        /// </summary>
+        public string AcquireTriggersLockKey
+        {
+            get
+            {
+                return this.AddPrefix(DefaultLockName + "_acquire_triggers");
             }
         }
 
