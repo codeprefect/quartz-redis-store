@@ -1,4 +1,4 @@
-﻿using Quartz;
+using Quartz;
 using Quartz.Impl.Matchers;
 using Quartz.Spi;
 using StackExchange.Redis;
@@ -33,26 +33,26 @@ namespace QuartzRedis.Store
         ///             <see cref="T:Quartz.Spi.IJobStore"/> with the same name and group should be
         ///             over-written.
         ///             </param>
-        public override void StoreJob(IJobDetail jobDetail, bool replaceExisting)
+        public override async Task StoreJob(IJobDetail jobDetail, bool replaceExisting)
         {
             var jobHashKey = RedisJobStoreSchema.JobHashKey(jobDetail.Key);
             var jobDataMapHashKey = RedisJobStoreSchema.JobDataMapHashKey(jobDetail.Key);
             var jobGroupSetKey = RedisJobStoreSchema.JobGroupSetKey(jobDetail.Key.Group);
 
-            if (Db.KeyExists(jobHashKey) && !replaceExisting)
+            if (await Db.KeyExistsAsync(jobHashKey).ConfigureAwait(false) && !replaceExisting)
             {
                 throw new ObjectAlreadyExistsException(jobDetail);
             }
 
-            Db.HashSet(jobHashKey, ConvertToHashEntries(jobDetail));
+            await Db.HashSetAsync(jobHashKey, ConvertToHashEntries(jobDetail)).ConfigureAwait(false);
 
-            Db.HashSet(jobDataMapHashKey, ConvertToHashEntries(jobDetail.JobDataMap));
+            await Db.HashSetAsync(jobDataMapHashKey, ConvertToHashEntries(jobDetail.JobDataMap)).ConfigureAwait(false);
 
-            Db.SetAdd(RedisJobStoreSchema.JobsSetKey(), jobHashKey);
+            await Db.SetAddAsync(RedisJobStoreSchema.JobsSetKey(), jobHashKey).ConfigureAwait(false);
 
-            Db.SetAdd(RedisJobStoreSchema.JobGroupsSetKey(), jobGroupSetKey);
+            await Db.SetAddAsync(RedisJobStoreSchema.JobGroupsSetKey(), jobGroupSetKey).ConfigureAwait(false);
 
-            Db.SetAdd(jobGroupSetKey, jobHashKey);
+            await Db.SetAddAsync(jobGroupSetKey, jobHashKey).ConfigureAwait(false);
 
         }
 
@@ -62,10 +62,9 @@ namespace QuartzRedis.Store
         /// <param name="trigger">The <see cref="T:Quartz.ITrigger"/> to be stored.</param><param name="replaceExisting">If <see langword="true"/>, any <see cref="T:Quartz.ITrigger"/> existing in
         ///             the <see cref="T:Quartz.Spi.IJobStore"/> with the same name and group should
         ///             be over-written.</param><throws>ObjectAlreadyExistsException </throws>
-        public override void StoreTrigger(ITrigger trigger, bool replaceExisting)
+        public override async Task StoreTrigger(ITrigger trigger, bool replaceExisting)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(trigger.Key);
-            var triggerDataMapHashKey = RedisJobStoreSchema.TriggerJobDataMapHashKey(trigger.Key);
             var triggerGroupSetKey = RedisJobStoreSchema.TriggerGroupSetKey(trigger.Key.Group);
             var jobTriggerSetKey = RedisJobStoreSchema.JobTriggersSetKey(trigger.JobKey);
 
@@ -74,7 +73,7 @@ namespace QuartzRedis.Store
                 throw new NotImplementedException("Unknown trigger, only SimpleTrigger and CronTrigger are supported");
             }
 
-            var triggerExists = Db.KeyExists(triggerHashKey);
+            var triggerExists = await Db.KeyExistsAsync(triggerHashKey).ConfigureAwait(false);
 
             if (triggerExists && replaceExisting == false)
             {
@@ -82,60 +81,59 @@ namespace QuartzRedis.Store
             }
 
 
-            Db.HashSet(triggerHashKey, ConvertToHashEntries(trigger));
-            Db.HashSet(RedisJobStoreSchema.TriggerDataMapHashKey(trigger.Key), ConvertToHashEntries(((IOperableTrigger)trigger).JobDataMap));
-            Db.SetAdd(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey);
-            Db.SetAdd(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupSetKey);
-            Db.SetAdd(triggerGroupSetKey, triggerHashKey);
-            Db.SetAdd(jobTriggerSetKey, triggerHashKey);
+            await Db.HashSetAsync(triggerHashKey, ConvertToHashEntries(trigger)).ConfigureAwait(false);
+            await Db.HashSetAsync(RedisJobStoreSchema.TriggerDataMapHashKey(trigger.Key), ConvertToHashEntries(((IOperableTrigger)trigger).JobDataMap)).ConfigureAwait(false);
+            await Db.SetAddAsync(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey).ConfigureAwait(false);
+            await Db.SetAddAsync(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupSetKey).ConfigureAwait(false);
+            await Db.SetAddAsync(triggerGroupSetKey, triggerHashKey).ConfigureAwait(false);
+            await Db.SetAddAsync(jobTriggerSetKey, triggerHashKey).ConfigureAwait(false);
 
             if (!string.IsNullOrEmpty(trigger.CalendarName))
             {
                 var calendarTriggersSetKey = RedisJobStoreSchema.CalendarTriggersSetKey(trigger.CalendarName);
-                Db.SetAdd(calendarTriggersSetKey, triggerHashKey);
+                await Db.SetAddAsync(calendarTriggersSetKey, triggerHashKey).ConfigureAwait(false);
             }
 
-            //if trigger already exists, remove it from all the possible states. 
+            //if trigger already exists, remove it from all the possible states.
             if (triggerExists)
             {
-                this.UnsetTriggerState(triggerHashKey);
+                await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
             }
 
-            //then update it with the new state in the its respectvie sorted set. 
-            UpdateTriggerState(trigger);
+            //then update it with the new state in the its respectvie sorted set.
+            await UpdateTriggerState(trigger).ConfigureAwait(false);
         }
-        
+
         /// <summary>
-        /// remove the trigger from all the possible state in the its respective sorted set. 
+        /// remove the trigger from all the possible state in the its respective sorted set.
         /// </summary>
         /// <param name="triggerKey">trigger key</param>
         /// <returns>succeeds or not</returns>
-        public override bool UnsetTriggerState(TriggerKey triggerKey)
+        public override Task<bool> UnsetTriggerState(TriggerKey triggerKey)
         {
-            var removedList = (from RedisTriggerState state in Enum.GetValues(typeof(RedisTriggerState)) select Db.SortedSetRemove(RedisJobStoreSchema.TriggerStateSetKey(state), RedisJobStoreSchema.TriggerHashkey(triggerKey))).ToList();
-
-            if (removedList.Any(x => x))
-            {
-                return Db.KeyDelete(
-                    RedisJobStoreSchema.TriggerLockKey(triggerKey));
-            }
-
-            return false;
+            return UnsetTriggerState(RedisJobStoreSchema.TriggerHashkey(triggerKey));
         }
 
         /// <summary>
-        /// remove the trigger from all the possible state in the its respective sorted set. 
+        /// remove the trigger from all the possible state in the its respective sorted set.
         /// </summary>
         /// <param name="triggerHashKey">trigger hash key</param>
         /// <returns>succeeds or not</returns>
-        public override bool UnsetTriggerState(string triggerHashKey)
+        public override async Task<bool> UnsetTriggerState(string triggerHashKey)
         {
-            var removedList = (from RedisTriggerState state in Enum.GetValues(typeof(RedisTriggerState)) select Db.SortedSetRemove(RedisJobStoreSchema.TriggerStateSetKey(state), triggerHashKey)).ToList();
-
-            if (removedList.Any(x => x))
+            var removed = false;
+            foreach (RedisTriggerState state in Enum.GetValues(typeof(RedisTriggerState)))
             {
-                return Db.KeyDelete(
-                    RedisJobStoreSchema.TriggerLockKey(RedisJobStoreSchema.TriggerKey(triggerHashKey)));
+                if (await Db.SortedSetRemoveAsync(RedisJobStoreSchema.TriggerStateSetKey(state), triggerHashKey).ConfigureAwait(false))
+                {
+                    removed = true;
+                }
+            }
+
+            if (removed)
+            {
+                await Db.HashDeleteAsync(triggerHashKey, RedisJobStoreSchema.CurrentState).ConfigureAwait(false);
+                return await Db.KeyDeleteAsync(RedisJobStoreSchema.TriggerLockKey(RedisJobStoreSchema.TriggerKey(triggerHashKey))).ConfigureAwait(false);
             }
 
             return false;
@@ -151,27 +149,27 @@ namespace QuartzRedis.Store
         ///             in the <see cref="T:Quartz.Spi.IJobStore"/> that reference an existing
         ///             Calendar with the same name with have their next fire time
         ///             re-computed with the new <see cref="T:Quartz.ICalendar"/>.</param><throws>ObjectAlreadyExistsException </throws>
-        public override void StoreCalendar(string name, ICalendar calendar, bool replaceExisting, bool updateTriggers)
+        public override async Task StoreCalendar(string name, ICalendar calendar, bool replaceExisting, bool updateTriggers)
         {
             string calendarHashKey = RedisJobStoreSchema.CalendarHashKey(name);
 
-            if (replaceExisting == false && Db.KeyExists(calendarHashKey))
+            if (replaceExisting == false && await Db.KeyExistsAsync(calendarHashKey).ConfigureAwait(false))
             {
                 throw new ObjectAlreadyExistsException(string.Format("Calendar with key {0} already exists", calendarHashKey));
             }
 
-            Db.HashSet(calendarHashKey, ConvertToHashEntries(calendar));
-            Db.SetAdd(RedisJobStoreSchema.CalendarsSetKey(), calendarHashKey);
+            await Db.HashSetAsync(calendarHashKey, ConvertToHashEntries(calendar)).ConfigureAwait(false);
+            await Db.SetAddAsync(RedisJobStoreSchema.CalendarsSetKey(), calendarHashKey).ConfigureAwait(false);
 
             if (updateTriggers)
             {
                 var calendarTriggersSetkey = RedisJobStoreSchema.CalendarTriggersSetKey(name);
 
-                var triggerHashKeys = Db.SetMembers(calendarTriggersSetkey);
+                var triggerHashKeys = await Db.SetMembersAsync(calendarTriggersSetkey).ConfigureAwait(false);
 
                 foreach (var triggerHashKey in triggerHashKeys)
                 {
-                    var trigger = RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey));
+                    var trigger = await RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
 
                     if (trigger == null)
                     {
@@ -180,7 +178,7 @@ namespace QuartzRedis.Store
 
                     trigger.UpdateWithNewCalendar(calendar, TimeSpan.FromMilliseconds(MisfireThreshold));
 
-                    StoreTrigger(trigger, true);
+                    await StoreTrigger(trigger, true).ConfigureAwait(false);
                 }
             }
 
@@ -200,11 +198,11 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.ICalendar"/> with the given name
         ///             was found and removed from the store.
         /// </returns>
-        public override bool RemoveCalendar(string calendarName)
+        public override async Task<bool> RemoveCalendar(string calendarName)
         {
             var calendarTriggersSetKey = RedisJobStoreSchema.CalendarTriggersSetKey(calendarName);
 
-            if (Db.SetLength(calendarTriggersSetKey) > 0)
+            if (await Db.SetLengthAsync(calendarTriggersSetKey).ConfigureAwait(false) > 0)
             {
                 throw new JobPersistenceException(string.Format("There are triggers are using calendar {0}",
                                                                 calendarName));
@@ -212,7 +210,7 @@ namespace QuartzRedis.Store
 
             var calendarHashKey = RedisJobStoreSchema.CalendarHashKey(calendarName);
 
-            return Db.KeyDelete(calendarHashKey) && Db.SetRemove(RedisJobStoreSchema.CalendarsSetKey(), calendarHashKey);
+            return await Db.KeyDeleteAsync(calendarHashKey).ConfigureAwait(false) && await Db.SetRemoveAsync(RedisJobStoreSchema.CalendarsSetKey(), calendarHashKey).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -229,30 +227,30 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.IJob"/> with the given name and
         ///             group was found and removed from the store.
         /// </returns>
-        public override bool RemoveJob(JobKey jobKey)
+        public override async Task<bool> RemoveJob(JobKey jobKey)
         {
             var jobHashKey = RedisJobStoreSchema.JobHashKey(jobKey);
             var jobDataMapHashKey = RedisJobStoreSchema.JobDataMapHashKey(jobKey);
             var jobGroupSetKey = RedisJobStoreSchema.JobGroupSetKey(jobKey.Group);
             var jobTriggerSetKey = RedisJobStoreSchema.JobTriggersSetKey(jobKey);
 
-            var delJobHashKeyResult = Db.KeyDelete(jobHashKey);
+            var delJobHashKeyResult = await Db.KeyDeleteAsync(jobHashKey).ConfigureAwait(false);
 
-            Db.KeyDelete(jobDataMapHashKey);
+            await Db.KeyDeleteAsync(jobDataMapHashKey).ConfigureAwait(false);
 
-            Db.SetRemove(RedisJobStoreSchema.JobsSetKey(), jobHashKey);
+            await Db.SetRemoveAsync(RedisJobStoreSchema.JobsSetKey(), jobHashKey).ConfigureAwait(false);
 
-            Db.SetRemove(jobGroupSetKey, jobHashKey);
+            await Db.SetRemoveAsync(jobGroupSetKey, jobHashKey).ConfigureAwait(false);
 
-            var jobTriggerSetResult = Db.SetMembers(jobTriggerSetKey);
+            var jobTriggerSetResult = await Db.SetMembersAsync(jobTriggerSetKey).ConfigureAwait(false);
 
-            Db.KeyDelete(jobTriggerSetKey);
+            await Db.KeyDeleteAsync(jobTriggerSetKey).ConfigureAwait(false);
 
-            var jobGroupSetLengthResult = Db.SetLength(jobGroupSetKey);
+            var jobGroupSetLengthResult = await Db.SetLengthAsync(jobGroupSetKey).ConfigureAwait(false);
 
             if (jobGroupSetLengthResult == 0)
             {
-                Db.SetRemoveAsync(RedisJobStoreSchema.JobGroupsSetKey(), jobGroupSetKey);
+                await Db.SetRemoveAsync(RedisJobStoreSchema.JobGroupsSetKey(), jobGroupSetKey).ConfigureAwait(false);
             }
 
             // remove all triggers associated with this job
@@ -261,18 +259,25 @@ namespace QuartzRedis.Store
                 var triggerkey = RedisJobStoreSchema.TriggerKey(triggerHashKey);
                 var triggerGroupKey = RedisJobStoreSchema.TriggerGroupSetKey(triggerkey.Group);
 
-                this.UnsetTriggerState(triggerHashKey);
+                await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
 
-                Db.SetRemove(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey);
+                await Db.SetRemoveAsync(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey).ConfigureAwait(false);
 
-                Db.SetRemove(RedisJobStoreSchema.TriggerGroupSetKey(triggerkey.Group), triggerHashKey);
+                await Db.SetRemoveAsync(triggerGroupKey, triggerHashKey).ConfigureAwait(false);
 
-                if (Db.SetLength(RedisJobStoreSchema.TriggerGroupSetKey(triggerkey.Group)) == 0)
+                if (await Db.SetLengthAsync(triggerGroupKey).ConfigureAwait(false) == 0)
                 {
-                    Db.SetRemove(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupKey);
+                    await Db.SetRemoveAsync(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupKey).ConfigureAwait(false);
                 }
 
-                Db.KeyDelete(triggerHashKey.ToString());
+                var calendarName = await Db.HashGetAsync(triggerHashKey.ToString(), RedisJobStoreSchema.CalendarName).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(calendarName))
+                {
+                    await Db.SetRemoveAsync(RedisJobStoreSchema.CalendarTriggersSetKey(calendarName), triggerHashKey).ConfigureAwait(false);
+                }
+
+                await Db.KeyDeleteAsync(RedisJobStoreSchema.TriggerDataMapHashKey(triggerkey)).ConfigureAwait(false);
+                await Db.KeyDeleteAsync(triggerHashKey.ToString()).ConfigureAwait(false);
             }
 
             return delJobHashKeyResult;
@@ -283,7 +288,7 @@ namespace QuartzRedis.Store
         /// Pause the <see cref="T:Quartz.IJob"/> with the given key - by
         ///             pausing all of its current <see cref="T:Quartz.ITrigger"/>s.
         /// </summary>
-        public override IReadOnlyCollection<string> PauseJobs(GroupMatcher<JobKey> matcher)
+        public override async Task<IReadOnlyCollection<string>> PauseJobs(GroupMatcher<JobKey> matcher)
         {
             var pausedJobGroups = new List<string>();
 
@@ -291,31 +296,34 @@ namespace QuartzRedis.Store
             {
                 var jobGroupSetKey = RedisJobStoreSchema.JobGroupSetKey(matcher.CompareToValue);
 
-                if (Db.SetAdd(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroupSetKey))
+                if (await Db.SetAddAsync(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroupSetKey).ConfigureAwait(false))
                 {
                     pausedJobGroups.Add(RedisJobStoreSchema.JobGroup(jobGroupSetKey));
 
-                    foreach (RedisValue val in Db.SetMembers(jobGroupSetKey))
+                    foreach (RedisValue val in await Db.SetMembersAsync(jobGroupSetKey).ConfigureAwait(false))
                     {
-                        PauseJob(RedisJobStoreSchema.JobKey(val));
+                        await PauseJob(RedisJobStoreSchema.JobKey(val)).ConfigureAwait(false);
                     }
                 }
             }
             else
             {
-                var jobGroupSets = Db.SetMembers(RedisJobStoreSchema.JobGroupsSetKey());
+                var jobGroupSets = await Db.SetMembersAsync(RedisJobStoreSchema.JobGroupsSetKey()).ConfigureAwait(false);
 
-                var jobGroups = jobGroupSets.Where(jobGroupSet => matcher.CompareWithOperator.Evaluate(RedisJobStoreSchema.JobGroup(jobGroupSet), matcher.CompareToValue)).ToDictionary<RedisValue, string, RedisValue[]>(jobGroupSet => jobGroupSet, jobGroupSet => Db.SetMembers(jobGroupSet.ToString()));
-
-                foreach (var jobGroup in jobGroups)
+                foreach (var jobGroupSet in jobGroupSets)
                 {
-                    if (Db.SetAdd(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroup.Key))
+                    if (!matcher.CompareWithOperator.Evaluate(RedisJobStoreSchema.JobGroup(jobGroupSet), matcher.CompareToValue))
                     {
-                        pausedJobGroups.Add(RedisJobStoreSchema.JobGroup(jobGroup.Key));
+                        continue;
+                    }
 
-                        foreach (var jobHashKey in jobGroup.Value)
+                    if (await Db.SetAddAsync(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroupSet).ConfigureAwait(false))
+                    {
+                        pausedJobGroups.Add(RedisJobStoreSchema.JobGroup(jobGroupSet));
+
+                        foreach (var jobHashKey in await Db.SetMembersAsync(jobGroupSet.ToString()).ConfigureAwait(false))
                         {
-                            PauseJob(RedisJobStoreSchema.JobKey(jobHashKey));
+                            await PauseJob(RedisJobStoreSchema.JobKey(jobHashKey)).ConfigureAwait(false);
                         }
                     }
                 }
@@ -334,7 +342,7 @@ namespace QuartzRedis.Store
         ///             misfire instruction will be applied.
         /// </para>
         /// </summary>
-        public override IReadOnlyCollection<string> ResumeJobs(GroupMatcher<JobKey> matcher)
+        public override async Task<IReadOnlyCollection<string>> ResumeJobs(GroupMatcher<JobKey> matcher)
         {
             var resumedJobGroups = new List<string>();
 
@@ -342,8 +350,8 @@ namespace QuartzRedis.Store
             {
                 var jobGroupSetKey = RedisJobStoreSchema.JobGroupSetKey(matcher.CompareToValue);
 
-                var removedPausedResult = Db.SetRemove(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroupSetKey);
-                var jobsResult = Db.SetMembers(jobGroupSetKey);
+                var removedPausedResult = await Db.SetRemoveAsync(RedisJobStoreSchema.PausedJobGroupsSetKey(), jobGroupSetKey).ConfigureAwait(false);
+                var jobsResult = await Db.SetMembersAsync(jobGroupSetKey).ConfigureAwait(false);
 
 
                 if (removedPausedResult)
@@ -353,19 +361,19 @@ namespace QuartzRedis.Store
 
                 foreach (var job in jobsResult)
                 {
-                    ResumeJob(RedisJobStoreSchema.JobKey(job));
+                    await ResumeJob(RedisJobStoreSchema.JobKey(job)).ConfigureAwait(false);
                 }
             }
             else
             {
-                foreach (var jobGroupSetKey in Db.SetMembers(RedisJobStoreSchema.JobGroupsSetKey()))
+                foreach (var jobGroupSetKey in await Db.SetMembersAsync(RedisJobStoreSchema.JobGroupsSetKey()).ConfigureAwait(false))
                 {
                     if (matcher.CompareWithOperator.Evaluate(RedisJobStoreSchema.JobGroup(jobGroupSetKey),
                                                             matcher.CompareToValue))
                     {
 
-                        resumedJobGroups.AddRange(ResumeJobs(
-                                GroupMatcher<JobKey>.GroupEquals(RedisJobStoreSchema.JobGroup(jobGroupSetKey))));
+                        resumedJobGroups.AddRange(await ResumeJobs(
+                                GroupMatcher<JobKey>.GroupEquals(RedisJobStoreSchema.JobGroup(jobGroupSetKey))).ConfigureAwait(false));
                     }
                 }
             }
@@ -382,19 +390,19 @@ namespace QuartzRedis.Store
         /// </para>
         /// </summary>
         /// <seealso cref="T:System.String"/>
-        public override void ResumeTrigger(TriggerKey triggerKey)
+        public override async Task ResumeTrigger(TriggerKey triggerKey)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(triggerKey);
 
-            var triggerExists = Db.SetContains(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey);
+            var triggerExists = await Db.SetContainsAsync(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey).ConfigureAwait(false);
 
             var isPausedTrigger =
-                Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
-                                         triggerHashKey);
+                await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
+                                         triggerHashKey).ConfigureAwait(false);
 
             var isPausedBlockedTrigger =
-                Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
-                                         triggerHashKey);
+                await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
+                                         triggerHashKey).ConfigureAwait(false);
 
             if (triggerExists == false)
             {
@@ -407,7 +415,7 @@ namespace QuartzRedis.Store
                 return;
             }
 
-            var trigger = RetrieveTrigger(triggerKey);
+            var trigger = await RetrieveTrigger(triggerKey).ConfigureAwait(false);
 
             var jobHashKey = RedisJobStoreSchema.JobHashKey(trigger.JobKey);
 
@@ -416,16 +424,23 @@ namespace QuartzRedis.Store
             if (nextFireTime.HasValue)
             {
 
-                if (Db.SetContains(RedisJobStoreSchema.BlockedJobsSet(), jobHashKey))
+                if (await Db.SetContainsAsync(RedisJobStoreSchema.BlockedJobsSet(), jobHashKey).ConfigureAwait(false))
                 {
-                    SetTriggerState(RedisTriggerState.Blocked, nextFireTime.Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey);
+                    await SetTriggerState(RedisTriggerState.Blocked, nextFireTime.Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey).ConfigureAwait(false);
                 }
                 else
                 {
-                    SetTriggerState(RedisTriggerState.Waiting, nextFireTime.Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey);
+                    await SetTriggerState(RedisTriggerState.Waiting, nextFireTime.Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey).ConfigureAwait(false);
                 }
             }
-            ApplyMisfire(trigger);
+            else
+            {
+                // no more fire times left - it can't stay parked in Paused/PausedBlocked forever, and
+                // ApplyMisfire below is a no-op when there's no next fire time, so it can't rescue it either.
+                await SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey).ConfigureAwait(false);
+                SchedulerSignaler.NotifySchedulerListenersFinalized(trigger);
+            }
+            await ApplyMisfire(trigger).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -447,46 +462,46 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.ITrigger"/> with the given
         ///             name and group was found and removed from the store.
         /// </returns>
-        public override bool RemoveTrigger(TriggerKey triggerKey, bool removeNonDurableJob = true)
+        public override async Task<bool> RemoveTrigger(TriggerKey triggerKey, bool removeNonDurableJob = true)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(triggerKey);
 
-            if (!Db.KeyExists(triggerHashKey))
+            if (!await Db.KeyExistsAsync(triggerHashKey).ConfigureAwait(false))
             {
                 return false;
             }
 
-            IOperableTrigger trigger = RetrieveTrigger(triggerKey);
+            IOperableTrigger trigger = await RetrieveTrigger(triggerKey).ConfigureAwait(false);
 
             var triggerGroupSetKey = RedisJobStoreSchema.TriggerGroupSetKey(triggerKey.Group);
             var jobHashKey = RedisJobStoreSchema.JobHashKey(trigger.JobKey);
             var jobTriggerSetkey = RedisJobStoreSchema.JobTriggersSetKey(trigger.JobKey);
 
-            Db.SetRemove(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey);
+            await Db.SetRemoveAsync(RedisJobStoreSchema.TriggersSetKey(), triggerHashKey).ConfigureAwait(false);
 
-            Db.SetRemove(triggerGroupSetKey, triggerHashKey);
+            await Db.SetRemoveAsync(triggerGroupSetKey, triggerHashKey).ConfigureAwait(false);
 
-            Db.SetRemove(jobTriggerSetkey, triggerHashKey);
+            await Db.SetRemoveAsync(jobTriggerSetkey, triggerHashKey).ConfigureAwait(false);
 
-            if (Db.SetLength(triggerGroupSetKey) == 0)
+            if (await Db.SetLengthAsync(triggerGroupSetKey).ConfigureAwait(false) == 0)
             {
-                Db.SetRemove(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupSetKey);
+                await Db.SetRemoveAsync(RedisJobStoreSchema.TriggerGroupsSetKey(), triggerGroupSetKey).ConfigureAwait(false);
             }
 
             if (removeNonDurableJob)
             {
 
-                var jobTriggerSetKeyLengthResult = Db.SetLength(jobTriggerSetkey);
+                var jobTriggerSetKeyLengthResult = await Db.SetLengthAsync(jobTriggerSetkey).ConfigureAwait(false);
 
-                var jobExistsResult = Db.KeyExists(jobHashKey);
+                var jobExistsResult = await Db.KeyExistsAsync(jobHashKey).ConfigureAwait(false);
 
                 if (jobTriggerSetKeyLengthResult == 0 && jobExistsResult)
                 {
-                    var job = RetrieveJob(trigger.JobKey);
+                    var job = await RetrieveJob(trigger.JobKey).ConfigureAwait(false);
 
                     if (job.Durable == false)
                     {
-                        RemoveJob(job.Key);
+                        await RemoveJob(job.Key).ConfigureAwait(false);
                         SchedulerSignaler.NotifySchedulerListenersJobDeleted(job.Key);
                     }
                 }
@@ -494,12 +509,12 @@ namespace QuartzRedis.Store
 
             if (!string.IsNullOrEmpty(trigger.CalendarName))
             {
-                Db.SetRemove(RedisJobStoreSchema.CalendarTriggersSetKey(trigger.CalendarName), triggerHashKey);
+                await Db.SetRemoveAsync(RedisJobStoreSchema.CalendarTriggersSetKey(trigger.CalendarName), triggerHashKey).ConfigureAwait(false);
             }
 
-            this.UnsetTriggerState(triggerHashKey);
-            Db.KeyDelete(RedisJobStoreSchema.TriggerDataMapHashKey(triggerKey));
-            return Db.KeyDelete(triggerHashKey);
+            await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
+            await Db.KeyDeleteAsync(RedisJobStoreSchema.TriggerDataMapHashKey(triggerKey)).ConfigureAwait(false);
+            return await Db.KeyDeleteAsync(triggerHashKey).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -510,7 +525,7 @@ namespace QuartzRedis.Store
         ///             <see cref="T:Quartz.ITrigger"/>'s misfire instruction will be applied.
         /// </para>
         /// </summary>
-        public override IReadOnlyCollection<string> ResumeTriggers(GroupMatcher<TriggerKey> matcher)
+        public override async Task<IReadOnlyCollection<string>> ResumeTriggers(GroupMatcher<TriggerKey> matcher)
         {
             var resumedTriggerGroups = new List<string>();
 
@@ -519,20 +534,20 @@ namespace QuartzRedis.Store
                 var triggerGroupSetKey =
                     RedisJobStoreSchema.TriggerGroupSetKey(matcher.CompareToValue);
 
-                Db.SetRemove(RedisJobStoreSchema.PausedTriggerGroupsSetKey(), triggerGroupSetKey);
+                await Db.SetRemoveAsync(RedisJobStoreSchema.PausedTriggerGroupsSetKey(), triggerGroupSetKey).ConfigureAwait(false);
 
-                var triggerHashKeysResult = Db.SetMembers(triggerGroupSetKey);
+                var triggerHashKeysResult = await Db.SetMembersAsync(triggerGroupSetKey).ConfigureAwait(false);
 
                 foreach (var triggerHashKey in triggerHashKeysResult)
                 {
-                    var trigger = RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey));
+                    var trigger = await RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
 
                     if (trigger == null)
                     {
                         continue;
                     }
 
-                    ResumeTrigger(trigger.Key);
+                    await ResumeTrigger(trigger.Key).ConfigureAwait(false);
 
                     if (!resumedTriggerGroups.Contains(trigger.Key.Group))
                     {
@@ -542,12 +557,12 @@ namespace QuartzRedis.Store
             }
             else
             {
-                foreach (var triggerGroupSetKy in Db.SetMembers(RedisJobStoreSchema.TriggerGroupsSetKey()))
+                foreach (var triggerGroupSetKy in await Db.SetMembersAsync(RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false))
                 {
                     if (matcher.CompareWithOperator.Evaluate(RedisJobStoreSchema.TriggerGroup(triggerGroupSetKy),
                                                             matcher.CompareToValue))
                     {
-                        resumedTriggerGroups.AddRange(ResumeTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(triggerGroupSetKy))));
+                        resumedTriggerGroups.AddRange(await ResumeTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(triggerGroupSetKy))).ConfigureAwait(false));
                     }
                 }
             }
@@ -559,21 +574,21 @@ namespace QuartzRedis.Store
         /// <summary>
         /// Pause the <see cref="T:Quartz.ITrigger"/> with the given key.
         /// </summary>
-        public override void PauseTrigger(TriggerKey triggerKey)
+        public override async Task PauseTrigger(TriggerKey triggerKey)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(triggerKey);
 
-            var triggerExistsResult = Db.KeyExists(triggerHashKey);
+            var triggerExistsResult = await Db.KeyExistsAsync(triggerHashKey).ConfigureAwait(false);
 
             var completedScoreResult =
-                Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Completed),
-                                        triggerHashKey);
+                await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Completed),
+                                        triggerHashKey).ConfigureAwait(false);
 
-            var nextFireTimeResult = Db.HashGet(triggerHashKey, RedisJobStoreSchema.NextFireTime);
+            var nextFireTimeResult = await Db.HashGetAsync(triggerHashKey, RedisJobStoreSchema.NextFireTime).ConfigureAwait(false);
 
             var blockedScoreResult =
-                Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked),
-                                        triggerHashKey);
+                await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked),
+                                        triggerHashKey).ConfigureAwait(false);
 
 
             if (!triggerExistsResult)
@@ -590,11 +605,11 @@ namespace QuartzRedis.Store
 
             if (blockedScoreResult.HasValue)
             {
-                SetTriggerState(RedisTriggerState.PausedBlocked, nextFireTime, triggerHashKey);
+                await SetTriggerState(RedisTriggerState.PausedBlocked, nextFireTime, triggerHashKey).ConfigureAwait(false);
             }
             else
             {
-                SetTriggerState(RedisTriggerState.Paused, nextFireTime, triggerHashKey);
+                await SetTriggerState(RedisTriggerState.Paused, nextFireTime, triggerHashKey).ConfigureAwait(false);
             }
         }
 
@@ -609,7 +624,7 @@ namespace QuartzRedis.Store
         ///             state.  Preference is to return an empty list if none of the triggers
         ///             could be fired.
         /// </returns>
-        public override IReadOnlyCollection<TriggerFiredResult> TriggersFired(IReadOnlyCollection<IOperableTrigger> triggers)
+        public override async Task<IReadOnlyCollection<TriggerFiredResult>> TriggersFired(IReadOnlyCollection<IOperableTrigger> triggers)
         {
             var result = new List<TriggerFiredResult>();
 
@@ -617,10 +632,10 @@ namespace QuartzRedis.Store
             {
                 var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(trigger.Key);
 
-                var triggerExistResult = Db.KeyExists(triggerHashKey);
+                var triggerExistResult = await Db.KeyExistsAsync(triggerHashKey).ConfigureAwait(false);
                 var triggerAcquiredResult =
-                    Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired),
-                                             triggerHashKey);
+                    await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired),
+                                             triggerHashKey).ConfigureAwait(false);
 
                 if (triggerExistResult == false)
                 {
@@ -641,7 +656,7 @@ namespace QuartzRedis.Store
                 string calendarname = trigger.CalendarName;
                 if (!string.IsNullOrEmpty(calendarname))
                 {
-                    calendar = this.RetrieveCalendar(calendarname);
+                    calendar = await this.RetrieveCalendar(calendarname).ConfigureAwait(false);
 
                     if (calendar == null)
                     {
@@ -653,7 +668,7 @@ namespace QuartzRedis.Store
 
                 trigger.Triggered(calendar);
 
-                var job = this.RetrieveJob(trigger.JobKey);
+                var job = await this.RetrieveJob(trigger.JobKey).ConfigureAwait(false);
 
                 if (job == null)
                 {
@@ -669,31 +684,31 @@ namespace QuartzRedis.Store
                     var jobHasKey = this.RedisJobStoreSchema.JobHashKey(trigger.JobKey);
                     var jobTriggerSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(job.Key);
 
-                    foreach (var nonConcurrentTriggerHashKey in this.Db.SetMembers(jobTriggerSetKey))
+                    foreach (var nonConcurrentTriggerHashKey in await this.Db.SetMembersAsync(jobTriggerSetKey).ConfigureAwait(false))
                     {
                         var score =
-                            this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Waiting),
-                                                    nonConcurrentTriggerHashKey);
+                            await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Waiting),
+                                                    nonConcurrentTriggerHashKey).ConfigureAwait(false);
 
                         if (score.HasValue)
                         {
-                            this.SetTriggerState(RedisTriggerState.Blocked, score.Value, nonConcurrentTriggerHashKey);
+                            await this.SetTriggerState(RedisTriggerState.Blocked, score.Value, nonConcurrentTriggerHashKey, RedisTriggerState.Waiting).ConfigureAwait(false);
                         }
                         else
                         {
-                            score = this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
-                                                    nonConcurrentTriggerHashKey);
+                            score = await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
+                                                    nonConcurrentTriggerHashKey).ConfigureAwait(false);
                             if (score.HasValue)
                             {
-                                this.SetTriggerState(RedisTriggerState.PausedBlocked, score.Value, nonConcurrentTriggerHashKey);
+                                await this.SetTriggerState(RedisTriggerState.PausedBlocked, score.Value, nonConcurrentTriggerHashKey, RedisTriggerState.Paused).ConfigureAwait(false);
                             }
                         }
                     }
 
 
-                    Db.SetAdd(this.RedisJobStoreSchema.JobBlockedKey(job.Key), this.SchedulerInstanceId);
+                    await Db.SetAddAsync(this.RedisJobStoreSchema.JobBlockedKey(job.Key), this.SchedulerInstanceId).ConfigureAwait(false);
 
-                    Db.SetAdd(this.RedisJobStoreSchema.BlockedJobsSet(), jobHasKey);
+                    await Db.SetAddAsync(this.RedisJobStoreSchema.BlockedJobsSet(), jobHasKey).ConfigureAwait(false);
                 }
 
                 //release the fired triggers
@@ -701,24 +716,24 @@ namespace QuartzRedis.Store
                 if (nextFireTimeUtc != null)
                 {
                     var nextFireTime = nextFireTimeUtc.Value;
-                    this.Db.HashSet(triggerHashKey, RedisJobStoreSchema.NextFireTime, nextFireTime.DateTime.ToUnixTimeMilliSeconds());
-                    this.SetTriggerState(RedisTriggerState.Waiting, nextFireTime.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey);
-                    
+                    await this.Db.HashSetAsync(triggerHashKey, RedisJobStoreSchema.NextFireTime, nextFireTime.DateTime.ToUnixTimeMilliSeconds()).ConfigureAwait(false);
+                    await this.SetTriggerState(RedisTriggerState.Waiting, nextFireTime.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey, RedisTriggerState.Acquired).ConfigureAwait(false);
 
-                    double? oldscore = this.Db.SortedSetScore(this.RedisJobStoreSchema.JobBlockedKeyTime(job.Key),
-                                            triggerHashKey);
+
+                    double? oldscore = await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.JobBlockedKeyTime(job.Key),
+                                            triggerHashKey).ConfigureAwait(false);
                     if ((oldscore ?? 0) == nextFireTime.DateTime.ToUnixTimeMilliSeconds())
                     {
                         triggerflag = false;
                     }
-                    this.Db.SortedSetAdd(this.RedisJobStoreSchema.JobBlockedKeyTime(job.Key),
-                                        triggerHashKey, nextFireTime.DateTime.ToUnixTimeMilliSeconds());
+                    await this.Db.SortedSetAddAsync(this.RedisJobStoreSchema.JobBlockedKeyTime(job.Key),
+                                        triggerHashKey, nextFireTime.DateTime.ToUnixTimeMilliSeconds()).ConfigureAwait(false);
 
                 }
                 else
                 {
-                    this.Db.HashSet(triggerHashKey, RedisJobStoreSchema.NextFireTime, "");
-                    this.UnsetTriggerState(triggerHashKey);
+                    await this.Db.HashSetAsync(triggerHashKey, RedisJobStoreSchema.NextFireTime, "").ConfigureAwait(false);
+                    await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
                 }
 
                 if (triggerflag)
@@ -742,7 +757,7 @@ namespace QuartzRedis.Store
         ///             in the given <see cref="T:Quartz.IJobDetail"/> should be updated if the <see cref="T:Quartz.IJob"/>
         ///             is stateful.
         /// </summary>
-        public override void TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail, SchedulerInstruction triggerInstCode)
+        public override async Task TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail, SchedulerInstruction triggerInstCode)
         {
             var jobHashKey = this.RedisJobStoreSchema.JobHashKey(jobDetail.Key);
 
@@ -750,7 +765,7 @@ namespace QuartzRedis.Store
 
             var triggerHashKey = this.RedisJobStoreSchema.TriggerHashkey(trigger.Key);
 
-            if (this.Db.KeyExists(jobHashKey))
+            if (await this.Db.KeyExistsAsync(jobHashKey).ConfigureAwait(false))
             {
                 Logger.InfoFormat("{0} - Job has completed", jobHashKey);
 
@@ -758,10 +773,10 @@ namespace QuartzRedis.Store
                 {
                     var jobDataMap = jobDetail.JobDataMap;
 
-                    Db.KeyDelete(jobDataMapHashKey);
+                    await Db.KeyDeleteAsync(jobDataMapHashKey).ConfigureAwait(false);
                     if (jobDataMap != null && !jobDataMap.IsEmpty)
                     {
-                        Db.HashSet(jobDataMapHashKey, ConvertToHashEntries(jobDataMap));
+                        await Db.HashSetAsync(jobDataMapHashKey, ConvertToHashEntries(jobDataMap)).ConfigureAwait(false);
                     }
 
                 }
@@ -769,31 +784,31 @@ namespace QuartzRedis.Store
                 if (jobDetail.ConcurrentExecutionDisallowed)
                 {
 
-                    Db.SetRemove(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey);
+                    await Db.SetRemoveAsync(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey).ConfigureAwait(false);
 
-                    Db.KeyDelete(this.RedisJobStoreSchema.JobBlockedKey(jobDetail.Key));
+                    await Db.KeyDeleteAsync(this.RedisJobStoreSchema.JobBlockedKey(jobDetail.Key)).ConfigureAwait(false);
 
                     var jobTriggersSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(jobDetail.Key);
 
-                    foreach (var nonConcurrentTriggerHashKey in this.Db.SetMembers(jobTriggersSetKey))
+                    foreach (var nonConcurrentTriggerHashKey in await this.Db.SetMembersAsync(jobTriggersSetKey).ConfigureAwait(false))
                     {
                         var score =
-                            this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked),
-                                                    nonConcurrentTriggerHashKey);
+                            await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked),
+                                                    nonConcurrentTriggerHashKey).ConfigureAwait(false);
                         if (score.HasValue)
                         {
-                            this.SetTriggerState(RedisTriggerState.Waiting, score.Value, nonConcurrentTriggerHashKey);
+                            await this.SetTriggerState(RedisTriggerState.Waiting, score.Value, nonConcurrentTriggerHashKey, RedisTriggerState.Blocked).ConfigureAwait(false);
                         }
                         else
                         {
                             score =
-                                this.Db.SortedSetScore(
+                                await this.Db.SortedSetScoreAsync(
                                     this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
-                                    nonConcurrentTriggerHashKey);
+                                    nonConcurrentTriggerHashKey).ConfigureAwait(false);
 
                             if (score.HasValue)
                             {
-                                this.SetTriggerState(RedisTriggerState.Paused, score.Value, nonConcurrentTriggerHashKey);
+                                await this.SetTriggerState(RedisTriggerState.Paused, score.Value, nonConcurrentTriggerHashKey, RedisTriggerState.PausedBlocked).ConfigureAwait(false);
                             }
                         }
                     }
@@ -803,47 +818,47 @@ namespace QuartzRedis.Store
             }
             else
             {
-                this.Db.SetRemove(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey);
+                await this.Db.SetRemoveAsync(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey).ConfigureAwait(false);
             }
 
-            if (this.Db.KeyExists(triggerHashKey))
+            if (await this.Db.KeyExistsAsync(triggerHashKey).ConfigureAwait(false))
             {
                 if (triggerInstCode == SchedulerInstruction.DeleteTrigger)
                 {
                     if (trigger.GetNextFireTimeUtc().HasValue == false)
                     {
-                        if (string.IsNullOrEmpty(this.Db.HashGet(triggerHashKey, RedisJobStoreSchema.NextFireTime)))
+                        if (string.IsNullOrEmpty(await this.Db.HashGetAsync(triggerHashKey, RedisJobStoreSchema.NextFireTime).ConfigureAwait(false)))
                         {
-                            RemoveTrigger(trigger.Key);
+                            await RemoveTrigger(trigger.Key).ConfigureAwait(false);
                         }
                     }
                     else
                     {
-                        this.RemoveTrigger(trigger.Key);
+                        await this.RemoveTrigger(trigger.Key).ConfigureAwait(false);
                         this.SchedulerSignaler.SignalSchedulingChange(null);
                     }
                 }
                 else if (triggerInstCode == SchedulerInstruction.SetTriggerComplete)
                 {
-                    this.SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey);
+                    await this.SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey).ConfigureAwait(false);
                     this.SchedulerSignaler.SignalSchedulingChange(null);
                 }
                 else if (triggerInstCode == SchedulerInstruction.SetTriggerError)
                 {
                     double score = trigger.GetNextFireTimeUtc().HasValue
                                        ? trigger.GetNextFireTimeUtc().Value.DateTime.ToUnixTimeMilliSeconds() : 0;
-                    this.SetTriggerState(RedisTriggerState.Error, score, triggerHashKey);
+                    await this.SetTriggerState(RedisTriggerState.Error, score, triggerHashKey).ConfigureAwait(false);
                     this.SchedulerSignaler.SignalSchedulingChange(null);
                 }
                 else if (triggerInstCode == SchedulerInstruction.SetAllJobTriggersError)
                 {
                     var jobTriggersSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(jobDetail.Key);
 
-                    foreach (var errorTriggerHashKey in this.Db.SetMembers(jobTriggersSetKey))
+                    foreach (var errorTriggerHashKey in await this.Db.SetMembersAsync(jobTriggersSetKey).ConfigureAwait(false))
                     {
-                        var nextFireTime = this.Db.HashGet(errorTriggerHashKey.ToString(), RedisJobStoreSchema.NextFireTime);
+                        var nextFireTime = await this.Db.HashGetAsync(errorTriggerHashKey.ToString(), RedisJobStoreSchema.NextFireTime).ConfigureAwait(false);
                         var score = string.IsNullOrEmpty(nextFireTime) ? 0 : double.Parse(nextFireTime);
-                        this.SetTriggerState(RedisTriggerState.Error, score, errorTriggerHashKey);
+                        await this.SetTriggerState(RedisTriggerState.Error, score, errorTriggerHashKey).ConfigureAwait(false);
                     }
                     this.SchedulerSignaler.SignalSchedulingChange(null);
                 }
@@ -851,10 +866,10 @@ namespace QuartzRedis.Store
                 {
                     var jobTriggerSetKey = this.RedisJobStoreSchema.JobTriggersSetKey(jobDetail.Key);
 
-                    foreach (var completedTriggerHashKey in this.Db.SetMembers(jobTriggerSetKey))
+                    foreach (var completedTriggerHashKey in await this.Db.SetMembersAsync(jobTriggerSetKey).ConfigureAwait(false))
                     {
-                        this.SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(),
-                                             completedTriggerHashKey);
+                        await this.SetTriggerState(RedisTriggerState.Completed, DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds(),
+                                             completedTriggerHashKey).ConfigureAwait(false);
                     }
 
                     this.SchedulerSignaler.SignalSchedulingChange(null);
@@ -872,14 +887,14 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="matcher"/>
         /// <returns/>
-        public override IReadOnlyCollection<JobKey> JobKeys(GroupMatcher<JobKey> matcher)
+        public override async Task<IReadOnlyCollection<JobKey>> JobKeys(GroupMatcher<JobKey> matcher)
         {
             var jobKeys = new global::System.Collections.Generic.HashSet<JobKey>();
 
             if (matcher.CompareWithOperator.Equals(StringOperator.Equality))
             {
                 var jobGroupSetKey = this.RedisJobStoreSchema.JobGroupSetKey(matcher.CompareToValue);
-                var jobHashKeys = this.Db.SetMembers(jobGroupSetKey);
+                var jobHashKeys = await this.Db.SetMembersAsync(jobGroupSetKey).ConfigureAwait(false);
                 if (jobHashKeys != null)
                 {
                     foreach (var jobHashKey in jobHashKeys)
@@ -890,13 +905,19 @@ namespace QuartzRedis.Store
             }
             else
             {
-                var jobGroupSets = this.Db.SetMembers(this.RedisJobStoreSchema.JobGroupsSetKey());
+                var jobGroupSets = await this.Db.SetMembersAsync(this.RedisJobStoreSchema.JobGroupsSetKey()).ConfigureAwait(false);
 
-                var jobGroupsResult = (from groupSet in jobGroupSets where matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.JobGroup(groupSet), matcher.CompareToValue) select Db.SetMembers(groupSet.ToString())).ToList();
+                var matchingGroupKeys = jobGroupSets.Where(groupSet => matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.JobGroup(groupSet), matcher.CompareToValue)).ToList();
 
-                foreach (var jobHashKey in jobGroupsResult.Where(jobHashKeys => jobHashKeys != null).SelectMany(jobHashKeys => jobHashKeys))
+                // pipeline the per-group SetMembers calls into a single network round trip instead of one per group.
+                var pendingMembers = await Task.WhenAll(matchingGroupKeys.Select(groupKey => Db.SetMembersAsync(groupKey.ToString()))).ConfigureAwait(false);
+
+                foreach (var jobHashKeys in pendingMembers.Where(jobHashKeys => jobHashKeys != null))
                 {
-                    jobKeys.Add(this.RedisJobStoreSchema.JobKey(jobHashKey));
+                    foreach (var jobHashKey in jobHashKeys)
+                    {
+                        jobKeys.Add(this.RedisJobStoreSchema.JobKey(jobHashKey));
+                    }
                 }
             }
 
@@ -911,7 +932,7 @@ namespace QuartzRedis.Store
         ///             zero-length array (not <see langword="null"/>).
         /// </para>
         /// </summary>
-        public override IReadOnlyCollection<TriggerKey> TriggerKeys(GroupMatcher<TriggerKey> matcher)
+        public override async Task<IReadOnlyCollection<TriggerKey>> TriggerKeys(GroupMatcher<TriggerKey> matcher)
         {
             var triggerKeys = new global::System.Collections.Generic.HashSet<TriggerKey>();
 
@@ -920,7 +941,7 @@ namespace QuartzRedis.Store
                 var triggerGroupSetKey =
                     this.RedisJobStoreSchema.TriggerGroupSetKey(matcher.CompareToValue);
 
-                var triggers = this.Db.SetMembers(triggerGroupSetKey);
+                var triggers = await this.Db.SetMembersAsync(triggerGroupSetKey).ConfigureAwait(false);
 
 
                 foreach (var trigger in triggers)
@@ -930,10 +951,13 @@ namespace QuartzRedis.Store
             }
             else
             {
-                var triggerGroupSets = this.Db.SetMembers(this.RedisJobStoreSchema.TriggerGroupsSetKey());
-                var triggerGroupsResult = (from groupSet in triggerGroupSets where matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.TriggerGroup(groupSet), matcher.CompareToValue) select Db.SetMembers(groupSet.ToString())).ToList();
+                var triggerGroupSets = await this.Db.SetMembersAsync(this.RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false);
+                var matchingGroupKeys = triggerGroupSets.Where(groupSet => matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.TriggerGroup(groupSet), matcher.CompareToValue)).ToList();
 
-                foreach (var triggerHashKeys in triggerGroupsResult)
+                // pipeline the per-group SetMembers calls into a single network round trip instead of one per group.
+                var pendingMembers = await Task.WhenAll(matchingGroupKeys.Select(groupKey => Db.SetMembersAsync(groupKey.ToString()))).ConfigureAwait(false);
+
+                foreach (var triggerHashKeys in pendingMembers)
                 {
                     if (triggerHashKeys != null)
                     {
@@ -949,40 +973,50 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// Get the current state of the identified <see cref="T:Quartz.ITrigger"/>.
+        /// Get the current state of the identified <see cref="T:Quartz.ITrigger"/>. Prefers the cached
+        /// <see cref="RedisJobStoreSchema.CurrentState"/> hash field (a single round trip) - kept in sync by
+        /// every trigger-state mutation via SetTriggerState/UnsetTriggerState - and only falls back to
+        /// scanning every state's sorted set when that field is absent (e.g. a trigger untouched since
+        /// before this field existed, or one with genuinely no recorded state).
         /// </summary>
         /// <seealso cref="T:Quartz.TriggerState"/>
-        public override TriggerState GetTriggerState(TriggerKey triggerKey)
+        public override async Task<TriggerState> GetTriggerState(TriggerKey triggerKey)
         {
             var triggerHashKey = this.RedisJobStoreSchema.TriggerHashkey(triggerKey);
 
+            var cachedState = await this.Db.HashGetAsync(triggerHashKey, RedisJobStoreSchema.CurrentState).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(cachedState) && Enum.TryParse<RedisTriggerState>(cachedState, out var redisState))
+            {
+                return MapToQuartzTriggerState(redisState);
+            }
+
             if (
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
-                                        triggerHashKey) != null ||
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
-                                        triggerHashKey) != null)
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Paused),
+                                        triggerHashKey).ConfigureAwait(false) != null ||
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.PausedBlocked),
+                                        triggerHashKey).ConfigureAwait(false) != null)
             {
                 return TriggerState.Paused;
             }
             if (
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked), triggerHashKey) != null)
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Blocked), triggerHashKey).ConfigureAwait(false) != null)
             {
                 return TriggerState.Blocked;
             }
             if (
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Waiting),
-                                       triggerHashKey) != null || this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired), triggerHashKey) != null)
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Waiting),
+                                       triggerHashKey).ConfigureAwait(false) != null || await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired), triggerHashKey).ConfigureAwait(false) != null)
             {
                 return TriggerState.Normal;
             }
             if (
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Completed),
-                                       triggerHashKey) != null)
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Completed),
+                                       triggerHashKey).ConfigureAwait(false) != null)
             {
                 return TriggerState.Complete;
             }
             if (
-                this.Db.SortedSetScore(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Error), triggerHashKey)
+                await this.Db.SortedSetScoreAsync(this.RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Error), triggerHashKey).ConfigureAwait(false)
                 != null)
             {
                 return TriggerState.Error;
@@ -990,6 +1024,31 @@ namespace QuartzRedis.Store
 
             return TriggerState.None;
 
+        }
+
+        /// <summary>
+        /// maps the internal Redis-specific trigger state to the Quartz-facing <see cref="TriggerState"/>,
+        /// matching the same mapping the fallback sorted-set scan below uses.
+        /// </summary>
+        private static TriggerState MapToQuartzTriggerState(RedisTriggerState state)
+        {
+            switch (state)
+            {
+                case RedisTriggerState.Paused:
+                case RedisTriggerState.PausedBlocked:
+                    return TriggerState.Paused;
+                case RedisTriggerState.Blocked:
+                    return TriggerState.Blocked;
+                case RedisTriggerState.Waiting:
+                case RedisTriggerState.Acquired:
+                    return TriggerState.Normal;
+                case RedisTriggerState.Completed:
+                    return TriggerState.Complete;
+                case RedisTriggerState.Error:
+                    return TriggerState.Error;
+                default:
+                    return TriggerState.None;
+            }
         }
 
         /// <summary>
@@ -1001,19 +1060,19 @@ namespace QuartzRedis.Store
         ///             pause on any new triggers that are added to the group while the group is
         ///             paused.
         /// </remarks>
-        public override IReadOnlyCollection<string> PauseTriggers(GroupMatcher<TriggerKey> matcher)
+        public override async Task<IReadOnlyCollection<string>> PauseTriggers(GroupMatcher<TriggerKey> matcher)
         {
             var pausedTriggerGroups = new List<string>();
             if (matcher.CompareWithOperator.Equals(StringOperator.Equality))
             {
                 var triggerGroupSetKey = this.RedisJobStoreSchema.TriggerGroupSetKey(matcher.CompareToValue);
-                var addResult = this.Db.SetAdd(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(), triggerGroupSetKey);
+                var addResult = await this.Db.SetAddAsync(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(), triggerGroupSetKey).ConfigureAwait(false);
 
                 if (addResult)
                 {
-                    foreach (var triggerHashKey in this.Db.SetMembers(triggerGroupSetKey))
+                    foreach (var triggerHashKey in await this.Db.SetMembersAsync(triggerGroupSetKey).ConfigureAwait(false))
                     {
-                        this.PauseTrigger(this.RedisJobStoreSchema.TriggerKey(triggerHashKey));
+                        await this.PauseTrigger(this.RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
                     }
 
                     pausedTriggerGroups.Add(this.RedisJobStoreSchema.TriggerGroup(triggerGroupSetKey));
@@ -1021,21 +1080,24 @@ namespace QuartzRedis.Store
             }
             else
             {
-                var allTriggerGroups = this.Db.SetMembers(this.RedisJobStoreSchema.TriggerGroupsSetKey());
+                var allTriggerGroups = await this.Db.SetMembersAsync(this.RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false);
 
-                var triggerGroupsResult = allTriggerGroups.Where(groupHashKey => matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.TriggerGroup(groupHashKey), matcher.CompareToValue)).ToDictionary<RedisValue, string, RedisValue[]>(groupHashKey => groupHashKey, groupHashKey => Db.SetMembers(groupHashKey.ToString()));
-
-                foreach (var triggerGroup in triggerGroupsResult)
+                foreach (var groupHashKey in allTriggerGroups)
                 {
-                    var addResult = this.Db.SetAdd(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(), triggerGroup.Key);
+                    if (!matcher.CompareWithOperator.Evaluate(this.RedisJobStoreSchema.TriggerGroup(groupHashKey), matcher.CompareToValue))
+                    {
+                        continue;
+                    }
+
+                    var addResult = await this.Db.SetAddAsync(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(), groupHashKey).ConfigureAwait(false);
 
                     if (addResult)
                     {
-                        foreach (var triggerHashKey in triggerGroup.Value)
+                        foreach (var triggerHashKey in await Db.SetMembersAsync(groupHashKey.ToString()).ConfigureAwait(false))
                         {
-                            this.PauseTrigger(this.RedisJobStoreSchema.TriggerKey(triggerHashKey));
+                            await this.PauseTrigger(this.RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
                         }
-                        pausedTriggerGroups.Add(this.RedisJobStoreSchema.TriggerGroup(triggerGroup.Key));
+                        pausedTriggerGroups.Add(this.RedisJobStoreSchema.TriggerGroup(groupHashKey));
                     }
                 }
 
@@ -1046,17 +1108,17 @@ namespace QuartzRedis.Store
 
         /// <summary>
         /// update trigger state
-        /// if the group the trigger is in or the group the trigger's job is in are paused, then we need to check whether its job is in the blocked group, if it's then set its state to PausedBlocked, else set it to blocked.  
-        /// else set the trigger to the normal state (waiting), conver the nextfiretime into UTC milliseconds, so it could be stored as score in the sorted set. 
+        /// if the group the trigger is in or the group the trigger's job is in are paused, then we need to check whether its job is in the blocked group, if it's then set its state to PausedBlocked, else set it to blocked.
+        /// else set the trigger to the normal state (waiting), conver the nextfiretime into UTC milliseconds, so it could be stored as score in the sorted set.
         /// </summary>
         /// <param name="trigger">ITrigger</param>
-        private void UpdateTriggerState(ITrigger trigger)
+        private async Task UpdateTriggerState(ITrigger trigger)
         {
             var triggerPausedResult =
-                this.Db.SetContains(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(),
-                                     this.RedisJobStoreSchema.TriggerGroupSetKey(trigger.Key.Group));
-            var jobPausedResult = this.Db.SetContains(this.RedisJobStoreSchema.PausedJobGroupsSetKey(),
-                                                         this.RedisJobStoreSchema.JobGroupSetKey(trigger.JobKey.Group));
+                await this.Db.SetContainsAsync(this.RedisJobStoreSchema.PausedTriggerGroupsSetKey(),
+                                     this.RedisJobStoreSchema.TriggerGroupSetKey(trigger.Key.Group)).ConfigureAwait(false);
+            var jobPausedResult = await this.Db.SetContainsAsync(this.RedisJobStoreSchema.PausedJobGroupsSetKey(),
+                                                         this.RedisJobStoreSchema.JobGroupSetKey(trigger.JobKey.Group)).ConfigureAwait(false);
 
             if (triggerPausedResult || jobPausedResult)
             {
@@ -1065,21 +1127,21 @@ namespace QuartzRedis.Store
 
                 var jobHashKey = this.RedisJobStoreSchema.JobHashKey(trigger.JobKey);
 
-                if (this.Db.SetContains(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey))
+                if (await this.Db.SetContainsAsync(this.RedisJobStoreSchema.BlockedJobsSet(), jobHashKey).ConfigureAwait(false))
                 {
-                    this.SetTriggerState(RedisTriggerState.PausedBlocked,
-                        nextFireTime, this.RedisJobStoreSchema.TriggerHashkey(trigger.Key));
+                    await this.SetTriggerState(RedisTriggerState.PausedBlocked,
+                        nextFireTime, this.RedisJobStoreSchema.TriggerHashkey(trigger.Key)).ConfigureAwait(false);
                 }
                 else
                 {
-                    this.SetTriggerState(RedisTriggerState.Paused,
-                        nextFireTime, this.RedisJobStoreSchema.TriggerHashkey(trigger.Key));
+                    await this.SetTriggerState(RedisTriggerState.Paused,
+                        nextFireTime, this.RedisJobStoreSchema.TriggerHashkey(trigger.Key)).ConfigureAwait(false);
                 }
             }
             else if (trigger.GetNextFireTimeUtc().HasValue)
             {
-                this.SetTriggerState(RedisTriggerState.Waiting,
-                       trigger.GetNextFireTimeUtc().Value.DateTime.ToUnixTimeMilliSeconds(), this.RedisJobStoreSchema.TriggerHashkey(trigger.Key));
+                await this.SetTriggerState(RedisTriggerState.Waiting,
+                       trigger.GetNextFireTimeUtc().Value.DateTime.ToUnixTimeMilliSeconds(), this.RedisJobStoreSchema.TriggerHashkey(trigger.Key)).ConfigureAwait(false);
             }
         }
 

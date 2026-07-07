@@ -105,6 +105,13 @@ namespace QuartzRedis.Store
         public const string LockTime = "lock_time";
 
         /// <summary>
+        /// hash field name - current_state. Cached copy of whichever RedisTriggerState sorted set a
+        /// trigger currently belongs to, kept in sync by SetTriggerState/UnsetTriggerState, so
+        /// GetTriggerState can read it directly instead of scanning every state's sorted set.
+        /// </summary>
+        public const string CurrentState = "current_state";
+
+        /// <summary>
         /// hash value - Simple Trigger Type string
         /// </summary>
         public const string TriggerTypeSimple = "SIMPLE";
@@ -243,8 +250,10 @@ namespace QuartzRedis.Store
         /// <returns>JobKey</returns>
         public JobKey JobKey(string jobHashKey)
         {
+            // the name (last component) may itself contain the delimiter, so everything from the
+            // 3rd token onward belongs to the name - only the group (2nd token) is assumed delimiter-free.
             var hashParts = StripPrefix(jobHashKey).Split(new[] { _delimiter }, StringSplitOptions.None);
-            return new JobKey(hashParts[2], hashParts[1]);
+            return new JobKey(string.Join(_delimiter, hashParts.Skip(2)), hashParts[1]);
         }
 
         /// <summary>
@@ -320,16 +329,6 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// construct a hash Key for the trigger specific jobdatamap
-        /// </summary>
-        /// <param name="triggerKey">Trigger Key</param>
-        /// <returns>hash key</returns>
-        public string TriggerJobDataMapHashKey(TriggerKey triggerKey)
-        {
-            return this.AddPrefix("trigger"  + _delimiter + triggerKey.Group + _delimiter + triggerKey.Name + "job_data_map");
-        }
-
-        /// <summary>
         /// a set key which holds all the trigger groups whose state are paused.
         /// </summary>
         /// <returns>set key</returns>
@@ -354,8 +353,10 @@ namespace QuartzRedis.Store
         /// <returns>TriggerKey</returns>
         public TriggerKey TriggerKey(String triggerHashKey)
         {
+            // the name (last component) may itself contain the delimiter, so everything from the
+            // 3rd token onward belongs to the name - only the group (2nd token) is assumed delimiter-free.
             var hashParts = StripPrefix(triggerHashKey).Split(new[] { _delimiter }, StringSplitOptions.None);
-            return new TriggerKey(hashParts[2], hashParts[1]);
+            return new TriggerKey(string.Join(_delimiter, hashParts.Skip(2)), hashParts[1]);
         }
 
         /// <summary>
@@ -473,19 +474,6 @@ namespace QuartzRedis.Store
             get
             {
                 return this.AddPrefix(DefaultLockName + "_orphan_cleanup");
-            }
-        }
-
-        /// <summary>
-        /// dedicated lock key used to guard trigger acquisition (<see cref="BaseJobStorage.AcquireNextTriggers"/>),
-        /// kept separate from <see cref="LockKey"/> so that high-frequency, unrelated store writes (e.g. job
-        /// storage, triggered-job-complete callbacks) can never starve the scheduler out of acquiring new triggers.
-        /// </summary>
-        public string AcquireTriggersLockKey
-        {
-            get
-            {
-                return this.AddPrefix(DefaultLockName + "_acquire_triggers");
             }
         }
 

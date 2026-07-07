@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using Common.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
@@ -17,7 +17,7 @@ namespace QuartzRedis.Store
     public abstract class BaseJobStorage
     {
         /// <summary>
-        /// Logger 
+        /// Logger
         /// </summary>
         private readonly ILog _logger;
 
@@ -42,12 +42,14 @@ namespace QuartzRedis.Store
         protected int MisfireThreshold = 60000;
 
         /// <summary>
-        /// redis db.
+        /// redis db. All I/O against it is issued via the async (IDatabaseAsync) API so that lock-critical
+        /// paths (waited on via LockWithWaitAsync's non-blocking Task.Delay retry) never hand off to a
+        /// thread-pool thread that then blocks synchronously on a network round trip.
         /// </summary>
         protected IDatabase Db;
 
         /// <summary>
-        /// Triggerlock time out here we need to make sure the longest job should not exceed this amount of time, otherwise we need to increase it. 
+        /// Triggerlock time out here we need to make sure the longest job should not exceed this amount of time, otherwise we need to increase it.
         /// </summary>
         protected int TriggerLockTimeout;
 
@@ -94,7 +96,7 @@ namespace QuartzRedis.Store
         ///             <see cref="T:Quartz.Spi.IJobStore"/> with the same name and group should be
         ///             over-written.
         ///             </param>
-        public abstract void StoreJob(IJobDetail jobDetail, Boolean replaceExisting);
+        public abstract Task StoreJob(IJobDetail jobDetail, Boolean replaceExisting);
 
         /// <summary>
         /// Retrieve the <see cref="T:Quartz.IJobDetail"/> for the given
@@ -103,11 +105,11 @@ namespace QuartzRedis.Store
         /// <returns>
         /// The desired <see cref="T:Quartz.IJob"/>, or null if there is no match.
         /// </returns>
-        public IJobDetail? RetrieveJob(JobKey jobKey)
+        public async Task<IJobDetail?> RetrieveJob(JobKey jobKey)
         {
             var jobHashKey = RedisJobStoreSchema.JobHashKey(jobKey);
 
-            var jobDetails = Db.HashGetAll(jobHashKey);
+            var jobDetails = await Db.HashGetAllAsync(jobHashKey).ConfigureAwait(false);
 
             if (!jobDetails.Any())
             {
@@ -116,7 +118,7 @@ namespace QuartzRedis.Store
 
             var jobDataMapHashKey = RedisJobStoreSchema.JobDataMapHashKey(jobKey);
 
-            HashEntry[] jobDataMap = Db.HashGetAll(jobDataMapHashKey);
+            HashEntry[] jobDataMap = await Db.HashGetAllAsync(jobDataMapHashKey).ConfigureAwait(false);
 
             var jobProperties = ConvertToDictionaryString(jobDetails);
 
@@ -142,21 +144,21 @@ namespace QuartzRedis.Store
         /// <param name="trigger">The <see cref="T:Quartz.ITrigger"/> to be stored.</param><param name="replaceExisting">If <see langword="true"/>, any <see cref="T:Quartz.ITrigger"/> existing in
         ///             the <see cref="T:Quartz.Spi.IJobStore"/> with the same name and group should
         ///             be over-written.</param><throws>ObjectAlreadyExistsException </throws>
-        public abstract void StoreTrigger(ITrigger trigger, bool replaceExisting);
+        public abstract Task StoreTrigger(ITrigger trigger, bool replaceExisting);
 
         /// <summary>
-        /// remove the trigger from all the possible state in the its respective sorted set. 
+        /// remove the trigger from all the possible state in the its respective sorted set.
         /// </summary>
         /// <param name="triggerKey">trigger key</param>
         /// <returns>succeeds or not</returns>
-        public abstract bool UnsetTriggerState(TriggerKey triggerKey);
-        
+        public abstract Task<bool> UnsetTriggerState(TriggerKey triggerKey);
+
         /// <summary>
         /// remove the trigger state from all the possible sorted set.
         /// </summary>
         /// <param name="triggerHashKey">TriggerHashKey</param>
         /// <returns>succeeds or not</returns>
-        public abstract bool UnsetTriggerState(string triggerHashKey);
+        public abstract Task<bool> UnsetTriggerState(string triggerHashKey);
 
 
         /// <summary>
@@ -168,7 +170,7 @@ namespace QuartzRedis.Store
         ///             in the <see cref="T:Quartz.Spi.IJobStore"/> that reference an existing
         ///             Calendar with the same name with have their next fire time
         ///             re-computed with the new <see cref="T:Quartz.ICalendar"/>.</param><throws>ObjectAlreadyExistsException </throws>
-        public abstract void StoreCalendar(String name, ICalendar calendar, bool replaceExisting, bool updateTriggers);
+        public abstract Task StoreCalendar(String name, ICalendar calendar, bool replaceExisting, bool updateTriggers);
 
         /// <summary>
         /// Remove (delete) the <see cref="T:Quartz.ICalendar"/> with the
@@ -184,7 +186,7 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.ICalendar"/> with the given name
         ///             was found and removed from the store.
         /// </returns>
-        public abstract bool RemoveCalendar(String calendarName);
+        public abstract Task<bool> RemoveCalendar(String calendarName);
 
         /// <summary>
         /// Remove (delete) the <see cref="T:Quartz.IJob"/> with the given
@@ -200,7 +202,7 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.IJob"/> with the given name and
         ///             group was found and removed from the store.
         /// </returns>
-        public abstract bool RemoveJob(JobKey jobKey);
+        public abstract Task<bool> RemoveJob(JobKey jobKey);
 
         /// <summary>
         /// Pause all of the <see cref="T:Quartz.IJob"/>s in the given
@@ -212,7 +214,7 @@ namespace QuartzRedis.Store
         /// </para>
         /// </summary>
         /// <seealso cref="T:System.String"/>
-        public abstract IReadOnlyCollection<string> PauseJobs(GroupMatcher<JobKey> matcher);
+        public abstract Task<IReadOnlyCollection<string>> PauseJobs(GroupMatcher<JobKey> matcher);
 
         /// <summary>
         /// Resume (un-pause) the <see cref="T:Quartz.IJob"/> with the
@@ -223,11 +225,11 @@ namespace QuartzRedis.Store
         ///             instruction will be applied.
         /// </para>
         /// </summary>
-        public void ResumeJob(JobKey jobKey)
+        public async Task ResumeJob(JobKey jobKey)
         {
-            foreach (var trigger in GetTriggersForJob(jobKey))
+            foreach (var trigger in await GetTriggersForJob(jobKey).ConfigureAwait(false))
             {
-                ResumeTrigger(trigger.Key);
+                await ResumeTrigger(trigger.Key).ConfigureAwait(false);
             }
         }
 
@@ -235,11 +237,11 @@ namespace QuartzRedis.Store
         /// Pause the <see cref="T:Quartz.IJob"/> with the given key - by
         ///             pausing all of its current <see cref="T:Quartz.ITrigger"/>s.
         /// </summary>
-        public void PauseJob(JobKey jobKey)
+        public async Task PauseJob(JobKey jobKey)
         {
-            foreach (var trigger in GetTriggersForJob(jobKey))
+            foreach (var trigger in await GetTriggersForJob(jobKey).ConfigureAwait(false))
             {
-                PauseTrigger(trigger.Key);
+                await PauseTrigger(trigger.Key).ConfigureAwait(false);
             }
         }
 
@@ -253,7 +255,7 @@ namespace QuartzRedis.Store
         ///             misfire instruction will be applied.
         /// </para>
         /// </summary>
-        public abstract IReadOnlyCollection<string> ResumeJobs(GroupMatcher<JobKey> matcher);
+        public abstract Task<IReadOnlyCollection<string>> ResumeJobs(GroupMatcher<JobKey> matcher);
 
 
         /// <summary>
@@ -265,7 +267,7 @@ namespace QuartzRedis.Store
         /// </para>
         /// </summary>
         /// <seealso cref="T:System.String"/>
-        public abstract void ResumeTrigger(TriggerKey triggerKey);
+        public abstract Task ResumeTrigger(TriggerKey triggerKey);
 
         /// <summary>
         /// Remove (delete) the <see cref="T:Quartz.ITrigger"/> with the given key.
@@ -286,7 +288,7 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.ITrigger"/> with the given
         ///             name and group was found and removed from the store.
         /// </returns>
-        public abstract bool RemoveTrigger(TriggerKey triggerKey, bool removeNonDurableJob = true);
+        public abstract Task<bool> RemoveTrigger(TriggerKey triggerKey, bool removeNonDurableJob = true);
 
         /// <summary>
         /// Resume (un-pause) all of the <see cref="T:Quartz.ITrigger"/>s
@@ -296,12 +298,12 @@ namespace QuartzRedis.Store
         ///             <see cref="T:Quartz.ITrigger"/>'s misfire instruction will be applied.
         /// </para>
         /// </summary>
-        public abstract IReadOnlyCollection<string> ResumeTriggers(GroupMatcher<TriggerKey> matcher);
+        public abstract Task<IReadOnlyCollection<string>> ResumeTriggers(GroupMatcher<TriggerKey> matcher);
 
         /// <summary>
         /// Pause the <see cref="T:Quartz.ITrigger"/> with the given key.
         /// </summary>
-        public abstract void PauseTrigger(TriggerKey triggerKey);
+        public abstract Task PauseTrigger(TriggerKey triggerKey);
 
 
         /// <summary>
@@ -313,12 +315,12 @@ namespace QuartzRedis.Store
         /// </para>
         /// </summary>
         /// <seealso cref="M:Quartz.Spi.IJobStore.ResumeAll"/>
-        public void PauseAllTriggers()
+        public async Task PauseAllTriggers()
         {
-            RedisValue[] triggerGroups = Db.SetMembers(RedisJobStoreSchema.TriggerGroupsSetKey());
+            RedisValue[] triggerGroups = await Db.SetMembersAsync(RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false);
             foreach (var group in triggerGroups)
             {
-                PauseTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(group)));
+                await PauseTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(group))).ConfigureAwait(false);
             }
         }
 
@@ -331,36 +333,72 @@ namespace QuartzRedis.Store
         /// </para>
         /// </summary>
         /// <seealso cref="M:Quartz.Spi.IJobStore.PauseAll"/>
-        public void ResumeAllTriggers()
+        public async Task ResumeAllTriggers()
         {
-            RedisValue[] triggerGroups = Db.SetMembers(RedisJobStoreSchema.TriggerGroupsSetKey());
+            RedisValue[] triggerGroups = await Db.SetMembersAsync(RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false);
             foreach (var group in triggerGroups)
             {
-                ResumeTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(group)));
+                await ResumeTriggers(GroupMatcher<TriggerKey>.GroupEquals(RedisJobStoreSchema.TriggerGroup(group))).ConfigureAwait(false);
             }
         }
 
         /// <summary>
-        ///  Release triggers from the given current state to the new state if its locking scheduler has not registered as alive in the last triggerlocktimeout 
+        ///  Release triggers from the given current state to the new state if its locking scheduler has not registered as alive in the last triggerlocktimeout
         /// </summary>
         /// <param name="currentState"></param>
         /// <param name="newState"></param>
-        protected void ReleaseOrphanedTriggers(RedisTriggerState currentState, RedisTriggerState newState)
+        protected async Task ReleaseOrphanedTriggers(RedisTriggerState currentState, RedisTriggerState newState)
         {
-            SortedSetEntry[] triggers = Db.SortedSetRangeByScoreWithScores(RedisJobStoreSchema.TriggerStateSetKey(currentState), double.NegativeInfinity, double.PositiveInfinity);
+            SortedSetEntry[] triggers = await Db.SortedSetRangeByScoreWithScoresAsync(RedisJobStoreSchema.TriggerStateSetKey(currentState), double.NegativeInfinity, double.PositiveInfinity).ConfigureAwait(false);
+
+            // Blocked/PausedBlocked triggers are never themselves locked (LockTrigger is only ever called
+            // on the trigger that AcquireNextTriggers is acquiring for firing) - they're stuck only for as
+            // long as the job that blocked them is still actively being executed by a live scheduler.
+            bool checkBlockingJobInsteadOfOwnLock = currentState == RedisTriggerState.Blocked || currentState == RedisTriggerState.PausedBlocked;
 
             foreach (var sortedSetEntry in triggers)
             {
-                string lockedId =
-                    Db.StringGet(
-                        RedisJobStoreSchema.TriggerLockKey(
-                            RedisJobStoreSchema.TriggerKey(sortedSetEntry.Element.ToString())));
-                // Lock key has expired. We can safely alter the trigger's state.
-                if (string.IsNullOrEmpty(lockedId))
+                string triggerHashKey = sortedSetEntry.Element.ToString();
+
+                bool orphaned = checkBlockingJobInsteadOfOwnLock
+                    ? !await IsBlockingJobStillActive(triggerHashKey).ConfigureAwait(false)
+                    : string.IsNullOrEmpty(await Db.StringGetAsync(RedisJobStoreSchema.TriggerLockKey(RedisJobStoreSchema.TriggerKey(triggerHashKey))).ConfigureAwait(false));
+
+                // Lock key has expired (or the blocking job is no longer active). We can safely alter the trigger's state.
+                if (orphaned)
                 {
-                    SetTriggerState(newState, sortedSetEntry.Score, sortedSetEntry.Element);
+                    await SetTriggerState(newState, sortedSetEntry.Score, sortedSetEntry.Element, currentState).ConfigureAwait(false);
                 }
             }
+        }
+
+        /// <summary>
+        /// determines whether the job that put the given (Blocked/PausedBlocked) trigger into its current state
+        /// is still actively held by a live scheduler - i.e. whether any of the job's sibling triggers is
+        /// currently Acquired and still holds its per-trigger lock.
+        /// </summary>
+        /// <param name="triggerHashKey">hash key of the Blocked/PausedBlocked trigger</param>
+        /// <returns>true if the blocking job still appears to be executing</returns>
+        private async Task<bool> IsBlockingJobStillActive(string triggerHashKey)
+        {
+            var jobHashKey = await Db.HashGetAsync(triggerHashKey, RedisJobStoreSchema.JobHash).ConfigureAwait(false);
+            if (string.IsNullOrEmpty(jobHashKey))
+            {
+                return false;
+            }
+
+            var jobTriggersSetKey = RedisJobStoreSchema.JobTriggersSetKey(RedisJobStoreSchema.JobKey(jobHashKey));
+
+            foreach (var siblingHashKey in await Db.SetMembersAsync(jobTriggersSetKey).ConfigureAwait(false))
+            {
+                var siblingTriggerKey = RedisJobStoreSchema.TriggerKey(siblingHashKey.ToString());
+                if (!string.IsNullOrEmpty(await Db.StringGetAsync(RedisJobStoreSchema.TriggerLockKey(siblingTriggerKey)).ConfigureAwait(false)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -373,9 +411,9 @@ namespace QuartzRedis.Store
         /// <see langword="true"/> if a <see cref="T:Quartz.ITrigger"/> with the given
         ///             name and group was found and removed from the store.
         /// </returns>
-        public bool ReplaceTrigger(TriggerKey triggerKey, IOperableTrigger newTrigger)
+        public async Task<bool> ReplaceTrigger(TriggerKey triggerKey, IOperableTrigger newTrigger)
         {
-            var oldTrigger = RetrieveTrigger(triggerKey);
+            var oldTrigger = await RetrieveTrigger(triggerKey).ConfigureAwait(false);
 
             bool found = oldTrigger != null;
 
@@ -386,8 +424,8 @@ namespace QuartzRedis.Store
                     throw new JobPersistenceException("New Trigger is not linked to the same job as the old trigger");
                 }
 
-                RemoveTrigger(triggerKey, false);
-                StoreTrigger(newTrigger, false);
+                await RemoveTrigger(triggerKey, false).ConfigureAwait(false);
+                await StoreTrigger(newTrigger, false).ConfigureAwait(false);
             }
 
             return found;
@@ -400,11 +438,11 @@ namespace QuartzRedis.Store
         /// The desired <see cref="T:Quartz.ITrigger"/>, or null if there is no
         ///             match.
         /// </returns>
-        public IOperableTrigger RetrieveTrigger(TriggerKey triggerKey)
+        public async Task<IOperableTrigger> RetrieveTrigger(TriggerKey triggerKey)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(triggerKey);
 
-            var properties = Db.HashGetAll(triggerHashKey);
+            var properties = await Db.HashGetAllAsync(triggerHashKey).ConfigureAwait(false);
 
             if (properties != null && properties.Count() > 0)
             {
@@ -412,7 +450,7 @@ namespace QuartzRedis.Store
 
                 if (trigger != null)
                 {
-                    var dataMapEntries = Db.HashGetAll(RedisJobStoreSchema.TriggerDataMapHashKey(triggerKey));
+                    var dataMapEntries = await Db.HashGetAllAsync(RedisJobStoreSchema.TriggerDataMapHashKey(triggerKey)).ConfigureAwait(false);
                     if (dataMapEntries != null && dataMapEntries.Any())
                     {
                         foreach (var entry in ConvertToDictionaryString(dataMapEntries))
@@ -439,16 +477,21 @@ namespace QuartzRedis.Store
         /// starved by unrelated store traffic contending for the main lock - it either runs on schedule or is
         /// already being run by another concurrent caller/instance, in which case this call is a no-op.
         /// </remarks>
-        public void ReleaseTriggers()
+        public async Task ReleaseTriggers()
         {
+            // this is only ever invoked on a fixed TriggerLockTimeout/2 cadence (see RedisJobStore's
+            // _orphanCleanupTimer) - match that cadence here, otherwise every other tick is a guaranteed
+            // no-op (elapsed never exceeds the full TriggerLockTimeout on a tick that's only T/2 later).
+            double releaseThreshold = TriggerLockTimeout / 2.0;
+
             double misfireTime = DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds();
-            if (misfireTime - GetLastTriggersReleaseTime() <= TriggerLockTimeout)
+            if (misfireTime - await GetLastTriggersReleaseTime().ConfigureAwait(false) <= releaseThreshold)
             {
                 return;
             }
 
             var cleanupLockValue = Guid.NewGuid().ToString();
-            if (!Db.LockTake(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue, TimeSpan.FromMilliseconds(RedisLockTimeout)))
+            if (!await Db.LockTakeAsync(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue, TimeSpan.FromMilliseconds(RedisLockTimeout)).ConfigureAwait(false))
             {
                 // another caller/instance is already sweeping for orphaned triggers - nothing to do here.
                 return;
@@ -458,20 +501,23 @@ namespace QuartzRedis.Store
             {
                 // re-check under the lock in case another caller just finished the sweep.
                 misfireTime = DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds();
-                if (misfireTime - GetLastTriggersReleaseTime() <= TriggerLockTimeout)
+                if (misfireTime - await GetLastTriggersReleaseTime().ConfigureAwait(false) <= releaseThreshold)
                 {
                     return;
                 }
 
-                // it has been more than triggerLockTimeout milliseconds since we last released orphaned triggers
-                ReleaseOrphanedTriggers(RedisTriggerState.Acquired, RedisTriggerState.Waiting);
-                ReleaseOrphanedTriggers(RedisTriggerState.Blocked, RedisTriggerState.Waiting);
-                ReleaseOrphanedTriggers(RedisTriggerState.PausedBlocked, RedisTriggerState.Paused);
-                SetLastTriggerReleaseTime(DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds());
+                // it has been more than releaseThreshold milliseconds since we last released orphaned triggers
+                await ReleaseOrphanedTriggers(RedisTriggerState.Acquired, RedisTriggerState.Waiting).ConfigureAwait(false);
+                await ReleaseOrphanedTriggers(RedisTriggerState.Blocked, RedisTriggerState.Waiting).ConfigureAwait(false);
+                await ReleaseOrphanedTriggers(RedisTriggerState.PausedBlocked, RedisTriggerState.Paused).ConfigureAwait(false);
+                await SetLastTriggerReleaseTime(DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds()).ConfigureAwait(false);
             }
             finally
             {
-                Db.LockRelease(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue);
+                if (!await Db.LockReleaseAsync(RedisJobStoreSchema.OrphanCleanupLockKey, cleanupLockValue).ConfigureAwait(false))
+                {
+                    _logger.Warn("orphan cleanup lock was no longer held on release - it likely expired mid-sweep and was taken over by another instance");
+                }
             }
         }
 
@@ -484,9 +530,12 @@ namespace QuartzRedis.Store
         ///             milliseconds.</param><param name="maxCount"/><param name="timeWindow"/>
         /// <returns/>
         /// <seealso cref="T:Quartz.ITrigger"/>
-        public IReadOnlyCollection<IOperableTrigger> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow)
+        public async Task<IReadOnlyCollection<IOperableTrigger>> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow)
         {
-            ReleaseTriggers();
+            // orphaned-trigger recovery now runs entirely off RedisJobStore's independent background timer
+            // (see ReleaseTriggers's own remarks) - calling it here would run its unbounded sweep cost inline
+            // while the caller is holding the store lock, inflating lock hold time under exactly the load this
+            // method needs to stay fast under.
 
             var triggers = new List<IOperableTrigger>();
 
@@ -498,30 +547,46 @@ namespace QuartzRedis.Store
             const int maxMisfireRetries = 10;
             var attempt = 0;
 
+            // must accumulate across retries (not be recreated per-iteration) - otherwise a misfire on one
+            // trigger that restarts the scan forgets which non-concurrent jobs were already claimed earlier
+            // in this same call, letting two triggers of the same DisallowConcurrentExecution job both be acquired.
+            var acquiredJobHashKeysForNoConcurrentExec = new global::System.Collections.Generic.HashSet<string>();
+
             do
             {
                 retry = false;
                 attempt++;
 
-                var acquiredJobHashKeysForNoConcurrentExec = new global::System.Collections.Generic.HashSet<string>();
+                // each retry re-scans Waiting from scratch, so cap the fetch (and the acquisitions taken
+                // from it) to whatever's still needed - otherwise a misfire partway through one batch,
+                // followed by a full new batch on retry, can return more than the caller's requested maxCount.
+                var remaining = maxCount - triggers.Count;
+                if (remaining <= 0)
+                {
+                    break;
+                }
 
                 var score = ToUnixTimeMilliseconds(noLaterThan.Add(timeWindow));
 
                 var waitingStateTriggers =
-                    Db.SortedSetRangeByScoreWithScores(
+                    await Db.SortedSetRangeByScoreWithScoresAsync(
                         RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Waiting), 0, score,
-                        Exclude.None, Order.Ascending, 0, maxCount);
+                        Exclude.None, Order.Ascending, 0, remaining).ConfigureAwait(false);
                 foreach (var sortedSetEntry in waitingStateTriggers)
                 {
+                    if (triggers.Count >= maxCount)
+                    {
+                        break;
+                    }
 
-                    var trigger = RetrieveTrigger(RedisJobStoreSchema.TriggerKey(sortedSetEntry.Element));
+                    var trigger = await RetrieveTrigger(RedisJobStoreSchema.TriggerKey(sortedSetEntry.Element)).ConfigureAwait(false);
 
                     if (trigger == null)
                     {
                         continue;
                     }
 
-                    if (ApplyMisfire(trigger))
+                    if (await ApplyMisfire(trigger).ConfigureAwait(false))
                     {
                         retry = true;
                         break;
@@ -529,13 +594,13 @@ namespace QuartzRedis.Store
 
                     if (trigger.GetNextFireTimeUtc() == null)
                     {
-                        this.UnsetTriggerState(sortedSetEntry.Element);
+                        await this.UnsetTriggerState(sortedSetEntry.Element).ConfigureAwait(false);
                         continue;
                     }
 
                     var jobHashKey = RedisJobStoreSchema.JobHashKey(trigger.JobKey);
 
-                    var job = RetrieveJob(trigger.JobKey);
+                    var job = await RetrieveJob(trigger.JobKey).ConfigureAwait(false);
 
                     if (job != null && job.ConcurrentExecutionDisallowed)
                     {
@@ -546,9 +611,9 @@ namespace QuartzRedis.Store
                         acquiredJobHashKeysForNoConcurrentExec.Add(jobHashKey);
                     }
 
-                    LockTrigger(trigger.Key);
-                    SetTriggerState(RedisTriggerState.Acquired,
-                                         sortedSetEntry.Score, sortedSetEntry.Element);
+                    await LockTrigger(trigger.Key).ConfigureAwait(false);
+                    await SetTriggerState(RedisTriggerState.Acquired,
+                                         sortedSetEntry.Score, sortedSetEntry.Element, RedisTriggerState.Waiting).ConfigureAwait(false);
                     triggers.Add(trigger);
                 }
 
@@ -566,24 +631,24 @@ namespace QuartzRedis.Store
         ///             fire the given <see cref="T:Quartz.ITrigger"/>, that it had previously acquired
         ///             (reserved).
         /// </summary>
-        public void ReleaseAcquiredTrigger(IOperableTrigger trigger)
+        public async Task ReleaseAcquiredTrigger(IOperableTrigger trigger)
         {
             var triggerHashKey = RedisJobStoreSchema.TriggerHashkey(trigger.Key);
 
             var score =
-                Db.SortedSetScore(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired),
-                                        triggerHashKey);
+                await Db.SortedSetScoreAsync(RedisJobStoreSchema.TriggerStateSetKey(RedisTriggerState.Acquired),
+                                        triggerHashKey).ConfigureAwait(false);
 
             if (score.HasValue)
             {
                 if (trigger.GetNextFireTimeUtc().HasValue)
                 {
-                    SetTriggerState(RedisTriggerState.Waiting,
-                                         trigger.GetNextFireTimeUtc().Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey);
+                    await SetTriggerState(RedisTriggerState.Waiting,
+                                         trigger.GetNextFireTimeUtc().Value.DateTime.ToUnixTimeMilliSeconds(), triggerHashKey, RedisTriggerState.Acquired).ConfigureAwait(false);
                 }
                 else
                 {
-                    this.UnsetTriggerState(triggerHashKey);
+                    await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
                 }
             }
         }
@@ -599,7 +664,7 @@ namespace QuartzRedis.Store
         ///             state.  Preference is to return an empty list if none of the triggers
         ///             could be fired.
         /// </returns>
-        public abstract IReadOnlyCollection<TriggerFiredResult> TriggersFired(IReadOnlyCollection<IOperableTrigger> triggers);
+        public abstract Task<IReadOnlyCollection<TriggerFiredResult>> TriggersFired(IReadOnlyCollection<IOperableTrigger> triggers);
 
         /// <summary>
         /// Inform the <see cref="T:Quartz.Spi.IJobStore"/> that the scheduler has completed the
@@ -608,7 +673,7 @@ namespace QuartzRedis.Store
         ///             in the given <see cref="T:Quartz.IJobDetail"/> should be updated if the <see cref="T:Quartz.IJob"/>
         ///             is stateful.
         /// </summary>
-        public abstract void TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail,
+        public abstract Task TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail,
                                                   SchedulerInstruction triggerInstCode);
 
         /// <summary>
@@ -619,12 +684,12 @@ namespace QuartzRedis.Store
         /// The desired <see cref="T:Quartz.ICalendar"/>, or null if there is no
         ///             match.
         /// </returns>
-        public ICalendar RetrieveCalendar(string calName)
+        public async Task<ICalendar> RetrieveCalendar(string calName)
         {
             var calendarHashKey = RedisJobStoreSchema.CalendarHashKey(calName);
             ICalendar calendar = null;
 
-            HashEntry[] calendarPropertiesInRedis = Db.HashGetAll(calendarHashKey);
+            HashEntry[] calendarPropertiesInRedis = await Db.HashGetAllAsync(calendarHashKey).ConfigureAwait(false);
 
             if (calendarPropertiesInRedis != null && calendarPropertiesInRedis.Count() > 0)
             {
@@ -646,22 +711,31 @@ namespace QuartzRedis.Store
         /// <remarks>
         /// If there are no matches, a zero-length array should be returned.
         /// </remarks>
-        public IReadOnlyCollection<IOperableTrigger> GetTriggersForJob(JobKey jobKey)
+        public async Task<IReadOnlyCollection<IOperableTrigger>> GetTriggersForJob(JobKey jobKey)
         {
             var jobTriggerSetKey = RedisJobStoreSchema.JobTriggersSetKey(jobKey);
-            var triggerHashKeys = Db.SetMembers(jobTriggerSetKey);
+            var triggerHashKeys = await Db.SetMembersAsync(jobTriggerSetKey).ConfigureAwait(false);
 
-            return triggerHashKeys.Select(triggerHashKey => RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey))).Where(t => t != null).ToList();
+            var result = new List<IOperableTrigger>();
+            foreach (var triggerHashKey in triggerHashKeys)
+            {
+                var trigger = await RetrieveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
+                if (trigger != null)
+                {
+                    result.Add(trigger);
+                }
+            }
+            return result;
         }
 
         /// <summary>
         /// Gets the paused trigger groups.
         /// </summary>
         /// <returns/>
-        public IReadOnlyCollection<string> GetPausedTriggerGroups()
+        public async Task<IReadOnlyCollection<string>> GetPausedTriggerGroups()
         {
             RedisValue[] triggerGroupSetKeys =
-                Db.SetMembers(RedisJobStoreSchema.PausedTriggerGroupsSetKey());
+                await Db.SetMembersAsync(RedisJobStoreSchema.PausedTriggerGroupsSetKey()).ConfigureAwait(false);
 
             var groups = new global::System.Collections.Generic.HashSet<string>();
 
@@ -679,10 +753,10 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="groupName"/>
         /// <returns/>
-        public bool IsJobGroupPaused(string groupName)
+        public Task<bool> IsJobGroupPaused(string groupName)
         {
             return
-                Db.SetContains(RedisJobStoreSchema.PausedJobGroupsSetKey(),
+                Db.SetContainsAsync(RedisJobStoreSchema.PausedJobGroupsSetKey(),
                                      RedisJobStoreSchema.JobGroupSetKey(groupName));
         }
 
@@ -692,10 +766,10 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="groupName"/>
         /// <returns/>
-        public bool IsTriggerGroupPaused(string groupName)
+        public Task<bool> IsTriggerGroupPaused(string groupName)
         {
             return
-                Db.SetContains(RedisJobStoreSchema.PausedTriggerGroupsSetKey(),
+                Db.SetContainsAsync(RedisJobStoreSchema.PausedTriggerGroupsSetKey(),
                                     RedisJobStoreSchema.TriggerGroupSetKey(groupName));
         }
 
@@ -704,9 +778,9 @@ namespace QuartzRedis.Store
         ///             stored in the <see cref="T:Quartz.Spi.IJobStore"/>.
         /// </summary>
         /// <returns/>
-        public int NumberOfJobs()
+        public async Task<int> NumberOfJobs()
         {
-            return (int)Db.SetLength(RedisJobStoreSchema.JobsSetKey());
+            return (int)await Db.SetLengthAsync(RedisJobStoreSchema.JobsSetKey()).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -714,9 +788,9 @@ namespace QuartzRedis.Store
         ///             stored in the <see cref="T:Quartz.Spi.IJobStore"/>.
         /// </summary>
         /// <returns/>
-        public int NumberOfTriggers()
+        public async Task<int> NumberOfTriggers()
         {
-            return (int)Db.SetLength(RedisJobStoreSchema.TriggersSetKey());
+            return (int)await Db.SetLengthAsync(RedisJobStoreSchema.TriggersSetKey()).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -724,9 +798,9 @@ namespace QuartzRedis.Store
         ///             stored in the <see cref="T:Quartz.Spi.IJobStore"/>.
         /// </summary>
         /// <returns/>
-        public int NumberOfCalendars()
+        public async Task<int> NumberOfCalendars()
         {
-            return (int)Db.SetLength(RedisJobStoreSchema.CalendarsSetKey());
+            return (int)await Db.SetLengthAsync(RedisJobStoreSchema.CalendarsSetKey()).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -739,7 +813,7 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="matcher"/>
         /// <returns/>
-        public abstract System.Collections.Generic.IReadOnlyCollection<JobKey> JobKeys(GroupMatcher<JobKey> matcher);
+        public abstract Task<System.Collections.Generic.IReadOnlyCollection<JobKey>> JobKeys(GroupMatcher<JobKey> matcher);
 
         /// <summary>
         /// Get the names of all of the <see cref="T:Quartz.ITrigger"/>s
@@ -749,7 +823,7 @@ namespace QuartzRedis.Store
         ///             zero-length array (not <see langword="null"/>).
         /// </para>
         /// </summary>
-        public abstract System.Collections.Generic.IReadOnlyCollection<TriggerKey> TriggerKeys(GroupMatcher<TriggerKey> matcher);
+        public abstract Task<System.Collections.Generic.IReadOnlyCollection<TriggerKey>> TriggerKeys(GroupMatcher<TriggerKey> matcher);
 
         /// <summary>
         /// Get the names of all of the <see cref="T:Quartz.IJob"/>
@@ -759,9 +833,9 @@ namespace QuartzRedis.Store
         ///             array (not <see langword="null"/>).
         /// </para>
         /// </summary>
-        public IReadOnlyCollection<string> JobGroupNames()
+        public async Task<IReadOnlyCollection<string>> JobGroupNames()
         {
-            RedisValue[] groupsSet = Db.SetMembers(RedisJobStoreSchema.JobGroupsSetKey());
+            RedisValue[] groupsSet = await Db.SetMembersAsync(RedisJobStoreSchema.JobGroupsSetKey()).ConfigureAwait(false);
 
             return groupsSet.Select(g => RedisJobStoreSchema.JobGroup(g)).ToList();
         }
@@ -774,9 +848,9 @@ namespace QuartzRedis.Store
         ///             array (not <see langword="null"/>).
         /// </para>
         /// </summary>
-        public IReadOnlyCollection<string> TriggerGroupNames()
+        public async Task<IReadOnlyCollection<string>> TriggerGroupNames()
         {
-            RedisValue[] groupsSet = Db.SetMembers(RedisJobStoreSchema.TriggerGroupsSetKey());
+            RedisValue[] groupsSet = await Db.SetMembersAsync(RedisJobStoreSchema.TriggerGroupsSetKey()).ConfigureAwait(false);
 
             return groupsSet.Select(g => RedisJobStoreSchema.TriggerGroup(g)).ToList();
         }
@@ -789,9 +863,9 @@ namespace QuartzRedis.Store
         ///             a zero-length array (not <see langword="null"/>).
         /// </para>
         /// </summary>
-        public IReadOnlyCollection<string> CalendarNames()
+        public async Task<IReadOnlyCollection<string>> CalendarNames()
         {
-            RedisValue[] calendarsSet = Db.SetMembers(RedisJobStoreSchema.CalendarsSetKey());
+            RedisValue[] calendarsSet = await Db.SetMembersAsync(RedisJobStoreSchema.CalendarsSetKey()).ConfigureAwait(false);
 
             return calendarsSet.Select(g => RedisJobStoreSchema.GetCalendarName(g)).ToList();
         }
@@ -800,7 +874,7 @@ namespace QuartzRedis.Store
         /// Get the current state of the identified <see cref="T:Quartz.ITrigger"/>.
         /// </summary>
         /// <seealso cref="T:Quartz.TriggerState"/>
-        public abstract TriggerState GetTriggerState(TriggerKey triggerKey);
+        public abstract Task<TriggerState> GetTriggerState(TriggerKey triggerKey);
 
         /// <summary>
         /// Pause all of the <see cref="T:Quartz.ITrigger"/>s in the
@@ -811,7 +885,7 @@ namespace QuartzRedis.Store
         ///             pause on any new triggers that are added to the group while the group is
         ///             paused.
         /// </remarks>
-        public abstract IReadOnlyCollection<string> PauseTriggers(GroupMatcher<TriggerKey> matcher);
+        public abstract Task<IReadOnlyCollection<string>> PauseTriggers(GroupMatcher<TriggerKey> matcher);
 
 
         /// <summary>
@@ -819,7 +893,7 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="trigger">IOperableTrigger</param>
         /// <returns>applied or not</returns>
-        protected bool ApplyMisfire(IOperableTrigger trigger)
+        protected async Task<bool> ApplyMisfire(IOperableTrigger trigger)
         {
             double misfireTime = DateTimeOffset.UtcNow.DateTime.ToUnixTimeMilliSeconds();
             double score = misfireTime;
@@ -844,21 +918,21 @@ namespace QuartzRedis.Store
 
             if (!string.IsNullOrEmpty(trigger.CalendarName))
             {
-                calendar = RetrieveCalendar(trigger.CalendarName);
+                calendar = await RetrieveCalendar(trigger.CalendarName).ConfigureAwait(false);
             }
 
             SchedulerSignaler.NotifyTriggerListenersMisfired((IOperableTrigger)trigger.Clone());
 
             trigger.UpdateAfterMisfire(calendar);
 
-            StoreTrigger(trigger, true);
+            await StoreTrigger(trigger, true).ConfigureAwait(false);
 
             var updatedNextFireTime = trigger.GetNextFireTimeUtc();
 
             if (!updatedNextFireTime.HasValue)
             {
-                SetTriggerState(RedisTriggerState.Completed,
-                                     score, RedisJobStoreSchema.TriggerHashkey(trigger.Key));
+                await SetTriggerState(RedisTriggerState.Completed,
+                                     score, RedisJobStoreSchema.TriggerHashkey(trigger.Key)).ConfigureAwait(false);
                 SchedulerSignaler.NotifySchedulerListenersFinalized(trigger);
             }
             else if (nextFireTime.Equals(updatedNextFireTime))
@@ -873,9 +947,9 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="jobKey">Jobkey</param>
         /// <returns>exists or not</returns>
-        public bool CheckExists(JobKey jobKey)
+        public Task<bool> CheckExists(JobKey jobKey)
         {
-            return Db.KeyExists(RedisJobStoreSchema.JobHashKey(jobKey));
+            return Db.KeyExistsAsync(RedisJobStoreSchema.JobHashKey(jobKey));
         }
 
 
@@ -884,9 +958,9 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="calName">Calendar Name</param>
         /// <returns>exists or not</returns>
-        public bool CheckExists(string calName)
+        public Task<bool> CheckExists(string calName)
         {
-            return Db.KeyExists(RedisJobStoreSchema.CalendarHashKey(calName));
+            return Db.KeyExistsAsync(RedisJobStoreSchema.CalendarHashKey(calName));
         }
 
 
@@ -895,36 +969,36 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="triggerKey">TriggerKey</param>
         /// <returns>exists or not</returns>
-        public bool CheckExists(TriggerKey triggerKey)
+        public Task<bool> CheckExists(TriggerKey triggerKey)
         {
-            return Db.KeyExists(RedisJobStoreSchema.TriggerHashkey(triggerKey));
+            return Db.KeyExistsAsync(RedisJobStoreSchema.TriggerHashkey(triggerKey));
         }
 
         /// <summary>
         /// delete all scheduling data - all jobs, triggers and calendars. Scheduler.Clear()
         /// </summary>
-        public void ClearAllSchedulingData()
+        public async Task ClearAllSchedulingData()
         {
             // delete triggers
             foreach (string jobHashKey in
-                Db.SetMembers(RedisJobStoreSchema.JobsSetKey()))
+                await Db.SetMembersAsync(RedisJobStoreSchema.JobsSetKey()).ConfigureAwait(false))
             {
-                RemoveJob(RedisJobStoreSchema.JobKey(jobHashKey));
+                await RemoveJob(RedisJobStoreSchema.JobKey(jobHashKey)).ConfigureAwait(false);
             }
 
-            foreach (var triggerHashKey in Db.SetMembers(RedisJobStoreSchema.TriggersSetKey()))
+            foreach (var triggerHashKey in await Db.SetMembersAsync(RedisJobStoreSchema.TriggersSetKey()).ConfigureAwait(false))
             {
-                RemoveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey));
+                await RemoveTrigger(RedisJobStoreSchema.TriggerKey(triggerHashKey)).ConfigureAwait(false);
             }
 
-            foreach (var calHashName in Db.SetMembers(RedisJobStoreSchema.CalendarsSetKey()))
+            foreach (var calHashName in await Db.SetMembersAsync(RedisJobStoreSchema.CalendarsSetKey()).ConfigureAwait(false))
             {
-                Db.KeyDelete(RedisJobStoreSchema.CalendarTriggersSetKey(RedisJobStoreSchema.GetCalendarName(calHashName)));
-                RemoveCalendar(RedisJobStoreSchema.GetCalendarName(calHashName));
+                await Db.KeyDeleteAsync(RedisJobStoreSchema.CalendarTriggersSetKey(RedisJobStoreSchema.GetCalendarName(calHashName))).ConfigureAwait(false);
+                await RemoveCalendar(RedisJobStoreSchema.GetCalendarName(calHashName)).ConfigureAwait(false);
             }
 
-            Db.KeyDelete(RedisJobStoreSchema.PausedTriggerGroupsSetKey());
-            Db.KeyDelete(RedisJobStoreSchema.PausedJobGroupsSetKey());
+            await Db.KeyDeleteAsync(RedisJobStoreSchema.PausedTriggerGroupsSetKey()).ConfigureAwait(false);
+            await Db.KeyDeleteAsync(RedisJobStoreSchema.PausedJobGroupsSetKey()).ConfigureAwait(false);
         }
 
 
@@ -932,9 +1006,9 @@ namespace QuartzRedis.Store
         /// Retrieve the last time (in milliseconds) that orphaned triggers were released
         /// </summary>
         /// <returns>time in milli seconds from epoch time</returns>
-        protected double GetLastTriggersReleaseTime()
+        protected async Task<double> GetLastTriggersReleaseTime()
         {
-            var lastReleaseTime = Db.StringGet(RedisJobStoreSchema.LastTriggerReleaseTime());
+            var lastReleaseTime = await Db.StringGetAsync(RedisJobStoreSchema.LastTriggerReleaseTime()).ConfigureAwait(false);
 
             if (string.IsNullOrEmpty(lastReleaseTime))
             {
@@ -947,22 +1021,64 @@ namespace QuartzRedis.Store
         /// Set the last time at which orphaned triggers were released
         /// </summary>
         /// <param name="time">time in milli seconds from epoch time</param>
-        protected void SetLastTriggerReleaseTime(double time)
+        protected Task SetLastTriggerReleaseTime(double time)
         {
-            Db.StringSet(RedisJobStoreSchema.LastTriggerReleaseTime(), time);
+            return Db.StringSetAsync(RedisJobStoreSchema.LastTriggerReleaseTime(), time);
         }
 
         /// <summary>
         /// Set a trigger state by adding the trigger to the relevant sorted set, using its next fire time as the score.
+        /// Also keeps the trigger's cached "current state" hash field (<see cref="RedisJobStoreSchema.CurrentState"/>)
+        /// in sync, so <see cref="GetTriggerState"/> can read it directly instead of scanning every state's sorted set.
         /// </summary>
         /// <param name="state">RedisTriggerState</param>
         /// <param name="score">time in milli seconds from epoch time</param>
         /// <param name="triggerHashKey">TriggerHashKey</param>
+        /// <param name="knownCurrentState">if the caller already knows which single state the trigger is
+        /// currently in, pass it here to remove the trigger from just that one sorted set instead of blindly
+        /// scanning/removing from every possible state (7 round trips) - a significant win on hot paths like
+        /// AcquireNextTriggers where the prior state is always known. Leave null for the safe, general fallback.
+        /// Acts as a compare-and-swap: if the trigger is no longer in the presumed prior state (some other
+        /// caller already moved it since this caller last observed it - e.g. the independent orphan-cleanup
+        /// sweep racing a fresh TriggersFired/ReleaseAcquiredTrigger, since that sweep intentionally runs
+        /// outside the main store lock), this is a no-op rather than blindly resurrecting a stale transition.</param>
         /// <returns>succeeds or not</returns>
-        protected bool SetTriggerState(RedisTriggerState state, double score, string triggerHashKey)
+        protected async Task<bool> SetTriggerState(RedisTriggerState state, double score, string triggerHashKey, RedisTriggerState? knownCurrentState = null)
         {
-            this.UnsetTriggerState(triggerHashKey);
-            return Db.SortedSetAdd(RedisJobStoreSchema.TriggerStateSetKey(state), triggerHashKey, score);
+            // Moving a trigger INTO Acquired must never clear TriggerLockKey - LockTrigger sets that lock
+            // immediately before this call (see AcquireNextTriggers), and it needs to survive so
+            // ReleaseOrphanedTriggers can tell a live Acquired trigger apart from an orphaned one.
+            bool clearLockOnRemoval = state != RedisTriggerState.Acquired;
+
+            if (knownCurrentState.HasValue)
+            {
+                if (!await Db.SortedSetRemoveAsync(RedisJobStoreSchema.TriggerStateSetKey(knownCurrentState.Value), triggerHashKey).ConfigureAwait(false))
+                {
+                    return false;
+                }
+                if (clearLockOnRemoval)
+                {
+                    await Db.KeyDeleteAsync(RedisJobStoreSchema.TriggerLockKey(RedisJobStoreSchema.TriggerKey(triggerHashKey))).ConfigureAwait(false);
+                }
+            }
+            else if (clearLockOnRemoval)
+            {
+                await this.UnsetTriggerState(triggerHashKey).ConfigureAwait(false);
+            }
+            else
+            {
+                // remove from every other state's sorted set without touching the trigger's lock key.
+                foreach (RedisTriggerState otherState in Enum.GetValues(typeof(RedisTriggerState)))
+                {
+                    if (otherState != RedisTriggerState.Acquired)
+                    {
+                        await Db.SortedSetRemoveAsync(RedisJobStoreSchema.TriggerStateSetKey(otherState), triggerHashKey).ConfigureAwait(false);
+                    }
+                }
+            }
+
+            await Db.HashSetAsync(triggerHashKey, RedisJobStoreSchema.CurrentState, state.ToString()).ConfigureAwait(false);
+            return await Db.SortedSetAddAsync(RedisJobStoreSchema.TriggerStateSetKey(state), triggerHashKey, score).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -981,7 +1097,7 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// convert hashEntry array to Dictionary 
+        /// convert hashEntry array to Dictionary
         /// </summary>
         /// <param name="entries">HashEntry[]</param>
         /// <returns>IDictionary{string, string}</returns>
@@ -1085,9 +1201,9 @@ namespace QuartzRedis.Store
         /// </summary>
         /// <param name="triggerKey">TriggerKey</param>
         /// <returns>succeed or not</returns>
-        protected bool LockTrigger(TriggerKey triggerKey)
+        protected Task<bool> LockTrigger(TriggerKey triggerKey)
         {
-            return Db.StringSet(RedisJobStoreSchema.TriggerLockKey(triggerKey), SchedulerInstanceId, TimeSpan.FromMilliseconds(TriggerLockTimeout));
+            return Db.StringSetAsync(RedisJobStoreSchema.TriggerLockKey(triggerKey), SchedulerInstanceId, TimeSpan.FromMilliseconds(TriggerLockTimeout));
         }
 
 
@@ -1197,12 +1313,8 @@ namespace QuartzRedis.Store
                                           double.Parse(properties[RedisJobStoreSchema.PrevFireTime])));
             }
 
-            var triggerJobDataMapKey = RedisJobStoreSchema.TriggerJobDataMapHashKey(triggerKey);
-            var triggerJobDataMap = Db.HashGetAll(triggerJobDataMapKey);
-            if (triggerJobDataMap.Any())
-            {
-                trigger.JobDataMap = new JobDataMap(ConvertToDictionaryString(triggerJobDataMap) as IDictionary);
-            }
+            // trigger job-data-map entries are populated separately by the outer RetrieveTrigger(TriggerKey)
+            // overload from TriggerDataMapHashKey - there is no separate per-trigger-type job data map to read here.
         }
 
         /// <summary>
@@ -1231,69 +1343,12 @@ namespace QuartzRedis.Store
         /// try to acquire a named redis lock.
         /// </summary>
         /// <param name="lockKey">the redis key backing this lock.</param>
-        /// <param name="lockValue">the token to use for this lock attempt, returned to the caller if the lock is acquired so it can later be passed to <see cref="Unlock"/>.</param>
-        /// <returns>locked or not</returns>
-        private bool Lock(string lockKey, out string lockValue)
+        /// <returns>the acquired lock's token, or null if the lock could not be acquired.</returns>
+        private async Task<string> TryLock(string lockKey)
         {
             var guid = Guid.NewGuid().ToString();
-
-            var lockAcquired = Db.LockTake(lockKey, guid, TimeSpan.FromMilliseconds(RedisLockTimeout));
-            lockValue = lockAcquired ? guid : null;
-            return lockAcquired;
-        }
-
-        /// <summary>
-        /// try to acquire the main store lock, with retry - if acquire fails, then retry till it succeeds.
-        /// </summary>
-        /// <returns>the token that must be passed to <see cref="Unlock(string)"/> to release this lock.</returns>
-        public string LockWithWait()
-        {
-            return LockWithWait(RedisJobStoreSchema.LockKey);
-        }
-
-        /// <summary>
-        /// try to acquire the named lock, with retry - if acquire fails, then retry till it succeeds.
-        /// </summary>
-        /// <param name="lockKey">the redis key backing this lock - use a dedicated key per independent
-        /// critical section so unrelated operations don't contend with each other for the same lock.</param>
-        /// <returns>the token that must be passed to <see cref="Unlock(string, string)"/> to release this lock.</returns>
-        public string LockWithWait(string lockKey)
-        {
-            string lockValue;
-            while (!Lock(lockKey, out lockValue))
-            {
-                try
-                {
-                    _logger.Info("waiting for redis lock");
-                    Thread.Sleep(RandomInt(75, 125));
-                }
-                catch (ThreadInterruptedException ex)
-                {
-                    _logger.ErrorFormat("errored out on waiting for a lock", ex);
-                }
-            }
-
-            return lockValue;
-        }
-
-        /// <summary>
-        /// async counterpart to <see cref="LockWithWait(string)"/> - waits for the named lock without blocking
-        /// a thread-pool thread for the whole contention period (uses <see cref="Task.Delay(int)"/> instead of
-        /// <see cref="Thread.Sleep(int)"/> between retries). Use this for lock-critical paths that can be
-        /// contended under load, such as trigger acquisition.
-        /// </summary>
-        /// <param name="lockKey">the redis key backing this lock.</param>
-        /// <returns>the token that must be passed to <see cref="Unlock(string, string)"/> to release this lock.</returns>
-        public async Task<string> LockWithWaitAsync(string lockKey)
-        {
-            string lockValue;
-            while (!Lock(lockKey, out lockValue))
-            {
-                _logger.Info("waiting for redis lock");
-                await Task.Delay(RandomInt(75, 125)).ConfigureAwait(false);
-            }
-
-            return lockValue;
+            var lockAcquired = await Db.LockTakeAsync(lockKey, guid, TimeSpan.FromMilliseconds(RedisLockTimeout)).ConfigureAwait(false);
+            return lockAcquired ? guid : null;
         }
 
         /// <summary>
@@ -1310,24 +1365,39 @@ namespace QuartzRedis.Store
         }
 
         /// <summary>
-        /// release the main store lock.
+        /// waits for the named lock without blocking a thread-pool thread for the whole contention period
+        /// (uses <see cref="Task.Delay(int)"/> between retries, and every Redis call involved is issued via
+        /// the async API). Use this for every lock-critical section, since even brief contention would
+        /// otherwise tie up a worker thread doing nothing but waiting.
         /// </summary>
-        /// <param name="lockValue">the token returned by the matching <see cref="LockWithWait()"/> call.</param>
-        /// <returns>unlock succeeds or not</returns>
-        public bool Unlock(string lockValue)
+        /// <param name="lockKey">the redis key backing this lock.</param>
+        /// <returns>the token that must be passed to <see cref="UnlockAsync"/> to release this lock.</returns>
+        public async Task<string> LockWithWaitAsync(string lockKey)
         {
-            return Unlock(RedisJobStoreSchema.LockKey, lockValue);
+            string lockValue;
+            while ((lockValue = await TryLock(lockKey).ConfigureAwait(false)) == null)
+            {
+                _logger.Info("waiting for redis lock");
+                await Task.Delay(RandomInt(75, 125)).ConfigureAwait(false);
+            }
+
+            return lockValue;
         }
 
         /// <summary>
         /// release a named lock.
         /// </summary>
         /// <param name="lockKey">the redis key backing this lock.</param>
-        /// <param name="lockValue">the token returned by the matching <see cref="LockWithWait(string)"/> call.</param>
+        /// <param name="lockValue">the token returned by the matching <see cref="LockWithWaitAsync"/> call.</param>
         /// <returns>unlock succeeds or not</returns>
-        public bool Unlock(string lockKey, string lockValue)
+        public async Task<bool> UnlockAsync(string lockKey, string lockValue)
         {
-            return Db.LockRelease(lockKey, lockValue);
+            var released = await Db.LockReleaseAsync(lockKey, lockValue).ConfigureAwait(false);
+            if (!released)
+            {
+                _logger.WarnFormat("lock {0} was no longer held on release - it likely expired while held and was taken over by another caller", lockKey);
+            }
+            return released;
         }
 
         /// <summary>

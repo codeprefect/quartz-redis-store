@@ -1,4 +1,4 @@
-﻿using Common.Logging;
+using Common.Logging;
 using Quartz;
 using Quartz.Impl.Matchers;
 using Quartz.Spi;
@@ -7,7 +7,7 @@ using StackExchange.Redis;
 namespace QuartzRedis.Store
 {
     /// <summary>
-    /// Redis Job Store 
+    /// Redis Job Store
     /// </summary>
     public class RedisJobStore : IJobStore
     {
@@ -49,8 +49,8 @@ namespace QuartzRedis.Store
             get { return true; }
         }
         /// <summary>
-        /// How long (in milliseconds) the <see cref="T:Quartz.Spi.IJobStore"/> implementation 
-        ///             estimates that it will take to release a trigger and acquire a new one. 
+        /// How long (in milliseconds) the <see cref="T:Quartz.Spi.IJobStore"/> implementation
+        ///             estimates that it will take to release a trigger and acquire a new one.
         /// </summary>
         public long EstimatedTimeToReleaseAndAcquireTrigger
         {
@@ -65,12 +65,12 @@ namespace QuartzRedis.Store
         //    get { return true; }
         //}
         /// <summary>
-        /// Inform the <see cref="T:Quartz.Spi.IJobStore"/> of the Scheduler instance's Id, 
+        /// Inform the <see cref="T:Quartz.Spi.IJobStore"/> of the Scheduler instance's Id,
         ///             prior to initialize being invoked.
         /// </summary>
         public string InstanceId { get; set; }
         /// <summary>
-        /// Inform the <see cref="T:Quartz.Spi.IJobStore"/> of the Scheduler instance's name, 
+        /// Inform the <see cref="T:Quartz.Spi.IJobStore"/> of the Scheduler instance's name,
         ///             prior to initialize being invoked.
         /// </summary>
         public string InstanceName { get; set; }
@@ -94,7 +94,7 @@ namespace QuartzRedis.Store
         public string KeyPrefix { get; set; }
 
         /// <summary>
-        /// trigger lock time out, used to release the orphan triggers in case when a scheduler crashes and still has locks on some triggers. 
+        /// trigger lock time out, used to release the orphan triggers in case when a scheduler crashes and still has locks on some triggers.
         /// make sure the lock time out is bigger than the time for running the longest job.
         /// </summary>
         public int? TriggerLockTimeout { get; set; }
@@ -105,7 +105,7 @@ namespace QuartzRedis.Store
         public int? RedisLockTimeout { get; set; }
 
         /// <summary>
-        /// Redis Sentinel model  
+        /// Redis Sentinel model
         /// </summary>
         public bool IsSentinel { get; set; }
 
@@ -134,6 +134,11 @@ namespace QuartzRedis.Store
 
         public Task Initialize(ITypeLoadHelper loadHelper, ISchedulerSignaler signaler, CancellationToken cancellationToken = default)
         {
+            // a re-entrant call (e.g. a retried scheduler build reusing this instance) would otherwise
+            // overwrite _db/_orphanCleanupTimer without disposing the previous ones, leaking a
+            // ConnectionMultiplexer and a live Timer per extra call.
+            DisposeConnection();
+
             _storeSchema = new RedisJobStoreSchema(KeyPrefix ?? string.Empty, KeyDelimiter ?? ":");
             if (IsSentinel)
             {
@@ -167,11 +172,11 @@ namespace QuartzRedis.Store
             // sweep for orphaned trigger locks on a fixed cadence, independent of AcquireNextTriggers/the main
             // store lock, so recovery cannot be starved by unrelated store traffic under load.
             var cleanupInterval = TimeSpan.FromMilliseconds((TriggerLockTimeout ?? 300000) / 2.0);
-            _orphanCleanupTimer = new Timer(_ =>
+            _orphanCleanupTimer = new Timer(async _ =>
             {
                 try
                 {
-                    _storage.ReleaseTriggers();
+                    await _storage.ReleaseTriggers().ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -203,352 +208,355 @@ namespace QuartzRedis.Store
         public Task Shutdown(CancellationToken cancellationToken = default)
         {
             _logger.Debug("scheduler has shutdown");
-            _orphanCleanupTimer?.Dispose();
-            _db.Multiplexer.Dispose();
+            DisposeConnection();
             return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// disposes the current connection/timer (if any), waiting for any in-flight orphan-cleanup
+        /// callback to finish first so it can't be caught mid-flight issuing Redis calls against a
+        /// multiplexer this method is about to dispose out from under it.
+        /// </summary>
+        private void DisposeConnection()
+        {
+            if (_orphanCleanupTimer != null)
+            {
+                using (var timerDisposed = new ManualResetEvent(false))
+                {
+                    _orphanCleanupTimer.Dispose(timerDisposed);
+                    timerDisposed.WaitOne();
+                }
+                _orphanCleanupTimer = null!;
+            }
+
+            if (_db != null)
+            {
+                _db.Multiplexer.Dispose();
+                _db = null!;
+            }
         }
 
         public Task StoreJobAndTrigger(IJobDetail newJob, IOperableTrigger newTrigger, CancellationToken cancellationToken = default)
         {
             _logger.Debug("StoreJobAndTrigger");
-            DoWithLock(() =>
+            return DoWithLockAsync(async () =>
             {
-                _storage.StoreJob(newJob, false);
-                _storage.StoreTrigger(newTrigger, false);
-            }, "Could store job/trigger");
-            return Task.CompletedTask;
+                await _storage.StoreJob(newJob, false).ConfigureAwait(false);
+                await _storage.StoreTrigger(newTrigger, false).ConfigureAwait(false);
+            }, () => "Could store job/trigger");
         }
 
         public Task<bool> IsJobGroupPaused(string groupName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("IsJobGroupPaused");
-            return Task.FromResult(WithoutLock(() => _storage.IsJobGroupPaused(groupName),
-                              string.Format("Error on IsJobGroupPaused - Group {0}", groupName)));
+            return WithoutLockAsync(() => _storage.IsJobGroupPaused(groupName),
+                              () => string.Format("Error on IsJobGroupPaused - Group {0}", groupName));
         }
 
         public Task<bool> IsTriggerGroupPaused(string groupName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("IsTriggerGroupPaused");
-            return Task.FromResult(WithoutLock(() => _storage.IsTriggerGroupPaused(groupName),
-                              string.Format("Error on IsTriggerGroupPaused - Group {0}", groupName)));
+            return WithoutLockAsync(() => _storage.IsTriggerGroupPaused(groupName),
+                              () => string.Format("Error on IsTriggerGroupPaused - Group {0}", groupName));
         }
 
         public Task StoreJob(IJobDetail newJob, bool replaceExisting, CancellationToken cancellationToken = default)
         {
             _logger.Debug("StoreJob");
-            DoWithLock(() => _storage.StoreJob(newJob, replaceExisting), "Could not store job");
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.StoreJob(newJob, replaceExisting), () => "Could not store job");
         }
 
         public Task StoreJobsAndTriggers(IReadOnlyDictionary<IJobDetail, IReadOnlyCollection<ITrigger>> triggersAndJobs, bool replace, CancellationToken cancellationToken = default)
         {
             _logger.Debug("StoreJobsAndTriggers");
-            foreach (var job in triggersAndJobs)
+            // one lock acquisition for the whole batch instead of one per job - avoids k separate
+            // LockTake/LockRelease round trips and k independent contended-wait windows for a batch of k jobs.
+            return DoWithLockAsync(async () =>
             {
-                DoWithLock(() =>
+                foreach (var job in triggersAndJobs)
                 {
-                    _storage.StoreJob(job.Key, replace);
+                    await _storage.StoreJob(job.Key, replace).ConfigureAwait(false);
                     foreach (var trigger in job.Value)
                     {
-                        _storage.StoreTrigger(trigger, replace);
+                        await _storage.StoreTrigger(trigger, replace).ConfigureAwait(false);
                     }
-
-                }, "Could store job/trigger");
-
-            }
-            return Task.CompletedTask;
+                }
+            }, () => "Could store job/trigger");
         }
 
         public Task<bool> RemoveJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RemoveJob");
-            return Task.FromResult(DoWithLock(() => _storage.RemoveJob(jobKey),
-                              "Could not remove a job"));
+            return DoWithLockAsync(() => _storage.RemoveJob(jobKey), () => "Could not remove a job");
         }
 
         public Task<bool> RemoveJobs(IReadOnlyCollection<JobKey> jobKeys, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RemoveJobs");
-            bool removed = jobKeys.Count > 0;
-
-            foreach (var jobKey in jobKeys)
+            // one lock acquisition for the whole batch instead of one per job.
+            return DoWithLockAsync(async () =>
             {
-                DoWithLock(() =>
+                bool removed = jobKeys.Count > 0;
+                foreach (var jobKey in jobKeys)
                 {
-                    removed = _storage.RemoveJob(jobKey);
-                }, "Error on removing job");
-
-            }
-            return Task.FromResult(removed);
-        } 
+                    removed = await _storage.RemoveJob(jobKey).ConfigureAwait(false);
+                }
+                return removed;
+            }, () => "Error on removing job");
+        }
 
         public Task<IJobDetail?> RetrieveJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RetrieveJob");
-            return Task.FromResult<IJobDetail?>(WithoutLock(() => _storage.RetrieveJob(jobKey),
-                              "Could not retriev job"));
+            return DoWithLockAsync(() => _storage.RetrieveJob(jobKey),
+                              () => "Could not retriev job");
         }
 
         public Task StoreTrigger(IOperableTrigger newTrigger, bool replaceExisting, CancellationToken cancellationToken = default)
         {
             _logger.Debug("StoreTrigger");
-            DoWithLock(() => _storage.StoreTrigger(newTrigger, replaceExisting),
-                             "Could not store trigger");
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.StoreTrigger(newTrigger, replaceExisting),
+                             () => "Could not store trigger");
         }
 
         public Task<bool> RemoveTrigger(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RemoveTrigger");
-            return Task.FromResult(DoWithLock(() => _storage.RemoveTrigger(triggerKey),
-                              "Could not remove trigger"));
+            return DoWithLockAsync(() => _storage.RemoveTrigger(triggerKey), () => "Could not remove trigger");
         }
 
         public Task<bool> RemoveTriggers(IReadOnlyCollection<TriggerKey> triggerKeys, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RemoveTriggers");
-
-            bool removed = triggerKeys.Count > 0;
-
-            foreach (var triggerKey in triggerKeys)
+            // one lock acquisition for the whole batch instead of one per trigger.
+            return DoWithLockAsync(async () =>
             {
-                DoWithLock(() =>
+                bool removed = triggerKeys.Count > 0;
+                foreach (var triggerKey in triggerKeys)
                 {
-                    removed = _storage.RemoveTrigger(triggerKey);
-                }, "Error on removing trigger");
-
-            }
-            return Task.FromResult(removed);
+                    removed = await _storage.RemoveTrigger(triggerKey).ConfigureAwait(false);
+                }
+                return removed;
+            }, () => "Error on removing trigger");
         }
 
         public Task<bool> ReplaceTrigger(TriggerKey triggerKey, IOperableTrigger newTrigger, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ReplaceTrigger");
-
-            return Task.FromResult(DoWithLock(() => _storage.ReplaceTrigger(triggerKey, newTrigger),
-                              "Error on replacing trigger"));
+            return DoWithLockAsync(() => _storage.ReplaceTrigger(triggerKey, newTrigger), () => "Error on replacing trigger");
         }
 
         public Task<IOperableTrigger?> RetrieveTrigger(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RetrieveTrigger");
-
-            return Task.FromResult<IOperableTrigger?>(WithoutLock(() => _storage.RetrieveTrigger(triggerKey),
-                              "could not retrieve trigger"));
+            return DoWithLockAsync(() => _storage.RetrieveTrigger(triggerKey),
+                              () => "could not retrieve trigger");
         }
 
         public Task<bool> CalendarExists(string calName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("CalendarExists");
 
-            return Task.FromResult(WithoutLock(() => _storage.CheckExists(calName),
-                             string.Format("could not check if the calendar {0} exists", calName)));
+            return WithoutLockAsync(() => _storage.CheckExists(calName),
+                             () => string.Format("could not check if the calendar {0} exists", calName));
         }
 
         public Task<bool> CheckExists(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("CheckExists - Job");
-            return Task.FromResult(WithoutLock(() => _storage.CheckExists(jobKey),
-                              string.Format("could not check if the job {0} exists", jobKey)));
+            return WithoutLockAsync(() => _storage.CheckExists(jobKey),
+                              () => string.Format("could not check if the job {0} exists", jobKey));
         }
 
         public Task<bool> CheckExists(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("CheckExists - Trigger");
-            return Task.FromResult(WithoutLock(() => _storage.CheckExists(triggerKey),
-                            string.Format("could not check if the trigger {0} exists", triggerKey)));
+            return WithoutLockAsync(() => _storage.CheckExists(triggerKey),
+                            () => string.Format("could not check if the trigger {0} exists", triggerKey));
         }
 
         public Task ClearAllSchedulingData(CancellationToken cancellationToken = default)
         {
             _logger.Debug("ClearAllSchedulingData");
-            DoWithLock(() => _storage.ClearAllSchedulingData(), "Could not clear all the scheduling data");
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.ClearAllSchedulingData(), () => "Could not clear all the scheduling data");
         }
 
         public Task StoreCalendar(string name, ICalendar calendar, bool replaceExisting, bool updateTriggers, CancellationToken cancellationToken = default)
         {
             _logger.Debug("StoreCalendar");
-            DoWithLock(() => _storage.StoreCalendar(name, calendar, replaceExisting, updateTriggers),
-                       string.Format("Error on store calendar - {0}", name));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.StoreCalendar(name, calendar, replaceExisting, updateTriggers),
+                       () => string.Format("Error on store calendar - {0}", name));
         }
 
         public Task<bool> RemoveCalendar(string calName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RemoveCalendar");
-            return Task.FromResult(DoWithLock(() => _storage.RemoveCalendar(calName),
-                       string.Format("Error on remvoing calendar - {0}", calName)));
+            return DoWithLockAsync(() => _storage.RemoveCalendar(calName),
+                       () => string.Format("Error on remvoing calendar - {0}", calName));
         }
 
         public Task<ICalendar?> RetrieveCalendar(string calName, CancellationToken cancellationToken = default)
         {
             _logger.Debug("RetrieveCalendar");
-            return Task.FromResult<ICalendar?>(WithoutLock(() => _storage.RetrieveCalendar(calName),
-                $"Error on retrieving calendar - {calName}"));
+            return WithoutLockAsync(() => _storage.RetrieveCalendar(calName),
+                () => $"Error on retrieving calendar - {calName}");
         }
 
         public Task<int> GetNumberOfJobs(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfJobs");
-            return Task.FromResult(WithoutLock(() => _storage.NumberOfJobs(), "Error on getting Number of jobs"));
+            return WithoutLockAsync(() => _storage.NumberOfJobs(), () => "Error on getting Number of jobs");
         }
 
         public Task<int> GetNumberOfTriggers(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfTriggers");
-            return Task.FromResult(WithoutLock(() => _storage.NumberOfTriggers(), "Error on getting number of triggers"));
+            return WithoutLockAsync(() => _storage.NumberOfTriggers(), () => "Error on getting number of triggers");
         }
 
         public Task<int> GetNumberOfCalendars(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetNumberOfCalendars");
-            return Task.FromResult(WithoutLock(() => _storage.NumberOfCalendars(), "Error on getting number of calendars"));
+            return WithoutLockAsync(() => _storage.NumberOfCalendars(), () => "Error on getting number of calendars");
         }
 
         public Task<IReadOnlyCollection<JobKey>> GetJobKeys(GroupMatcher<JobKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetJobKeys");
-            return Task.FromResult(WithoutLock(() => _storage.JobKeys(matcher), "Error on getting job keys"));
+            return WithoutLockAsync(() => _storage.JobKeys(matcher), () => "Error on getting job keys");
         }
 
         public Task<IReadOnlyCollection<TriggerKey>> GetTriggerKeys(GroupMatcher<TriggerKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerKeys");
-            return Task.FromResult(WithoutLock(() => _storage.TriggerKeys(matcher), "Error on getting trigger keys"));
+            return WithoutLockAsync(() => _storage.TriggerKeys(matcher), () => "Error on getting trigger keys");
         }
 
         public Task<IReadOnlyCollection<string>> GetJobGroupNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetJobGroupNames");
-            return Task.FromResult(WithoutLock(() => _storage.JobGroupNames(), "Error on getting job group names"));
+            return WithoutLockAsync(() => _storage.JobGroupNames(), () => "Error on getting job group names");
         }
 
         public Task<IReadOnlyCollection<string>> GetTriggerGroupNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerGroupNames");
-            return Task.FromResult(WithoutLock(() => _storage.TriggerGroupNames(), "Error on getting trigger group names"));
+            return WithoutLockAsync(() => _storage.TriggerGroupNames(), () => "Error on getting trigger group names");
         }
 
         public Task<IReadOnlyCollection<string>> GetCalendarNames(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetCalendarNames");
-            return Task.FromResult(WithoutLock(() => _storage.CalendarNames(), "Error on getting calendar names"));
+            return WithoutLockAsync(() => _storage.CalendarNames(), () => "Error on getting calendar names");
         }
 
         public Task<IReadOnlyCollection<IOperableTrigger>> GetTriggersForJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggersForJob");
-            return Task.FromResult(WithoutLock(() => _storage.GetTriggersForJob(jobKey), string.Format("Error on getting triggers for job - {0}", jobKey)));
+            return DoWithLockAsync(() => _storage.GetTriggersForJob(jobKey), () => string.Format("Error on getting triggers for job - {0}", jobKey));
         }
 
         public Task<TriggerState> GetTriggerState(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetTriggerState");
-            return Task.FromResult(WithoutLock(() => _storage.GetTriggerState(triggerKey),
-                $"Error on getting trigger state for trigger - {triggerKey}"));
+            return DoWithLockAsync(() => _storage.GetTriggerState(triggerKey),
+                () => $"Error on getting trigger state for trigger - {triggerKey}");
         }
 
         public async Task ResetTriggerFromErrorState(TriggerKey triggerKey, CancellationToken cancellationToken = new CancellationToken())
         {
-            var triggerState = await GetTriggerState(triggerKey, cancellationToken);
-            
+            var triggerState = await GetTriggerState(triggerKey, cancellationToken).ConfigureAwait(false);
+
             if (triggerState == TriggerState.Error)
             {
-                DoWithLock(() => _storage.UnsetTriggerState(triggerKey), $"Error on unsetting trigger for trigger - {triggerKey}");
+                await DoWithLockAsync(() => _storage.UnsetTriggerState(triggerKey), () => $"Error on unsetting trigger for trigger - {triggerKey}").ConfigureAwait(false);
             }
         }
 
         public Task PauseTrigger(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("PauseTrigger");
-            DoWithLock(() => _storage.PauseTrigger(triggerKey),
-                              string.Format("Error on pausing trigger - {0}", triggerKey));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.PauseTrigger(triggerKey),
+                              () => string.Format("Error on pausing trigger - {0}", triggerKey));
         }
 
         public Task<IReadOnlyCollection<string>> PauseTriggers(GroupMatcher<TriggerKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("PauseTriggers");
-            return Task.FromResult(DoWithLock(() => _storage.PauseTriggers(matcher), "Error on pausing triggers"));
+            return DoWithLockAsync(() => _storage.PauseTriggers(matcher), () => "Error on pausing triggers");
         }
 
         public Task PauseJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("PauseJob");
-            DoWithLock(() => _storage.PauseJob(jobKey), string.Format("Error on pausing job - {0}", jobKey));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.PauseJob(jobKey), () => string.Format("Error on pausing job - {0}", jobKey));
         }
 
         public Task<IReadOnlyCollection<string>> PauseJobs(GroupMatcher<JobKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("PauseJobs");
-            return Task.FromResult(DoWithLock(() => _storage.PauseJobs(matcher), "Error on pausing jobs"));
+            return DoWithLockAsync(() => _storage.PauseJobs(matcher), () => "Error on pausing jobs");
         }
 
         public Task ResumeTrigger(TriggerKey triggerKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ResumeTrigger");
-            DoWithLock(() => _storage.ResumeTrigger(triggerKey),
-                       string.Format("Error on resuming trigger - {0}", triggerKey));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.ResumeTrigger(triggerKey),
+                       () => string.Format("Error on resuming trigger - {0}", triggerKey));
         }
 
         public Task<IReadOnlyCollection<string>> ResumeTriggers(GroupMatcher<TriggerKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ResumeTriggers");
-            return Task.FromResult(DoWithLock(() => _storage.ResumeTriggers(matcher), "Error on resume triggers"));
+            return DoWithLockAsync(() => _storage.ResumeTriggers(matcher), () => "Error on resume triggers");
         }
 
         public Task<IReadOnlyCollection<string>> GetPausedTriggerGroups(CancellationToken cancellationToken = default)
         {
             _logger.Debug("GetPausedTriggerGroups");
-            return Task.FromResult(WithoutLock(() => _storage.GetPausedTriggerGroups(), "Error on getting paused trigger groups"));
+            return WithoutLockAsync(() => _storage.GetPausedTriggerGroups(), () => "Error on getting paused trigger groups");
         }
 
         public Task ResumeJob(JobKey jobKey, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ResumeJob");
-            DoWithLock(() => _storage.ResumeJob(jobKey), string.Format("Error on resuming job - {0}", jobKey));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.ResumeJob(jobKey), () => string.Format("Error on resuming job - {0}", jobKey));
         }
 
         public Task<IReadOnlyCollection<string>> ResumeJobs(GroupMatcher<JobKey> matcher, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ResumeJobs");
-            return Task.FromResult(DoWithLock(() => _storage.ResumeJobs(matcher), "Error on resuming jobs"));
+            return DoWithLockAsync(() => _storage.ResumeJobs(matcher), () => "Error on resuming jobs");
         }
 
         public Task PauseAll(CancellationToken cancellationToken = default)
         {
             _logger.Debug("PauseAll");
-            DoWithLock(() => _storage.PauseAllTriggers(), "Error on pausing all");
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.PauseAllTriggers(), () => "Error on pausing all");
         }
 
         public Task ResumeAll(CancellationToken cancellationToken = default)
         {
             _logger.Debug("ResumeAll");
-            DoWithLock(() => _storage.ResumeAllTriggers(), "Error on resuming all");
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.ResumeAllTriggers(), () => "Error on resuming all");
         }
 
-        public async Task<IReadOnlyCollection<IOperableTrigger>> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow, CancellationToken cancellationToken = default)
+        public Task<IReadOnlyCollection<IOperableTrigger>> AcquireNextTriggers(DateTimeOffset noLaterThan, int maxCount, TimeSpan timeWindow, CancellationToken cancellationToken = default)
         {
             _logger.Debug("AcquireNextTriggers");
-            // uses a dedicated lock key (waited on without blocking a thread-pool thread, see
-            // DoWithLockAsync) so this can never be starved out by unrelated, high-frequency store writes
-            // (StoreJob, TriggeredJobComplete, ...) contending for the main store lock under load.
-            return await DoWithLockAsync(() => _storage.AcquireNextTriggers(noLaterThan, maxCount, timeWindow),
-                              "Error on acquiring next triggers", _storeSchema.AcquireTriggersLockKey).ConfigureAwait(false);
+            // shares the single store lock (via the non-blocking async wait) with every other write/mutating
+            // operation - AcquireNextTriggers/ReleaseAcquiredTrigger/TriggersFired/TriggeredJobComplete/etc. all
+            // mutate the same trigger-state sorted sets, so they must serialize against each other or a
+            // ConcurrentExecutionDisallowed job's triggers can be acquired/fired concurrently (see git history).
+            return DoWithLockAsync(() => _storage.AcquireNextTriggers(noLaterThan, maxCount, timeWindow),
+                              () => "Error on acquiring next triggers");
         }
 
-        public async Task ReleaseAcquiredTrigger(IOperableTrigger trigger, CancellationToken cancellationToken = default)
+        public Task ReleaseAcquiredTrigger(IOperableTrigger trigger, CancellationToken cancellationToken = default)
         {
             _logger.Debug("ReleaseAcquiredTrigger");
-            // shares AcquireNextTriggers' dedicated lock since both mutate the Acquired-state trigger set.
-            await DoWithLockAsync(() => { _storage.ReleaseAcquiredTrigger(trigger); return true; },
-                string.Format("Error on releasing acquired trigger - {0}", trigger), _storeSchema.AcquireTriggersLockKey).ConfigureAwait(false);
+            return DoWithLockAsync(() => _storage.ReleaseAcquiredTrigger(trigger),
+                () => string.Format("Error on releasing acquired trigger - {0}", trigger));
         }
 
         /// <summary>
@@ -560,15 +568,14 @@ namespace QuartzRedis.Store
         public Task<IReadOnlyCollection<TriggerFiredResult>> TriggersFired(IReadOnlyCollection<IOperableTrigger> triggers, CancellationToken cancellationToken = default)
         {
             _logger.Debug("TriggersFired");
-            return Task.FromResult(DoWithLock(() => _storage.TriggersFired(triggers), "Error on Triggers Fired"));
+            return DoWithLockAsync(() => _storage.TriggersFired(triggers), () => "Error on Triggers Fired");
         }
 
         public Task TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail, SchedulerInstruction triggerInstCode, CancellationToken cancellationToken = default)
         {
             _logger.Debug("TriggeredJobComplete");
-            DoWithLock(() => _storage.TriggeredJobComplete(trigger, jobDetail, triggerInstCode),
-                       string.Format("Error on triggered job complete - job:{0} - trigger:{1}", jobDetail, trigger));
-            return Task.CompletedTask;
+            return DoWithLockAsync(() => _storage.TriggeredJobComplete(trigger, jobDetail, triggerInstCode),
+                       () => string.Format("Error on triggered job complete - job:{0} - trigger:{1}", jobDetail, trigger));
         }
         #endregion
 
@@ -576,19 +583,21 @@ namespace QuartzRedis.Store
         #region private methods
 
         /// <summary>
-        /// runs a pure read against redis with the same error-handling semantics as <see cref="DoWithLock{T}"/>,
-        /// but without taking the store lock - single-key Redis reads are already atomic and don't need
-        /// app-level mutual exclusion, so locking them only adds needless contention with concurrent writers.
+        /// runs a pure read against redis with the same error-handling semantics as <see cref="DoWithLockAsync{T}"/>,
+        /// but without taking the store lock - use only for genuinely single-key/single-round-trip Redis reads,
+        /// which are atomic and don't need app-level mutual exclusion. Composite, multi-round-trip reads
+        /// (e.g. reading a trigger's several backing hashes) must go through <see cref="DoWithLockAsync{T}"/>
+        /// instead, or they can observe a torn snapshot mid-write.
         /// </summary>
         /// <typeparam name="T">return type of the Function</typeparam>
         /// <param name="fun">Fuction</param>
-        /// <param name="errorMessage">error message used to override the default one</param>
+        /// <param name="errorMessage">lazily-evaluated error message, built only if an exception is actually thrown</param>
         /// <returns></returns>
-        private T WithoutLock<T>(Func<T> fun, string errorMessage = "Job Storage error")
+        private async Task<T> WithoutLockAsync<T>(Func<Task<T>> fun, Func<string>? errorMessage = null)
         {
             try
             {
-                return fun.Invoke();
+                return await fun().ConfigureAwait(false);
             }
             catch (ObjectAlreadyExistsException)
             {
@@ -596,27 +605,27 @@ namespace QuartzRedis.Store
             }
             catch (Exception ex)
             {
-                throw new JobPersistenceException(errorMessage, ex);
+                throw new JobPersistenceException(errorMessage != null ? errorMessage() : "Job Storage error", ex);
             }
         }
 
         /// <summary>
-        /// crud opertion to redis with lock
+        /// crud operation to redis with the store lock held, waited on via <see cref="BaseJobStorage.LockWithWaitAsync"/>
+        /// so a contended lock doesn't block a thread-pool thread for the whole wait period. The underlying
+        /// storage call itself is awaited (rather than invoked synchronously) so that once the lock is won,
+        /// this doesn't hand off to a thread that then blocks on a network round trip either.
         /// </summary>
         /// <typeparam name="T">return type of the Function</typeparam>
         /// <param name="fun">Fuction</param>
-        /// <param name="errorMessage">error message used to override the default one</param>
-        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.
-        /// Pass a dedicated key for critical sections that must not be starved by unrelated store traffic
-        /// (e.g. trigger acquisition).</param>
+        /// <param name="errorMessage">lazily-evaluated error message, built only if an exception is actually thrown</param>
         /// <returns></returns>
-        private T DoWithLock<T>(Func<T> fun, string errorMessage = "Job Storage error", string lockKey = null)
+        private async Task<T> DoWithLockAsync<T>(Func<Task<T>> fun, Func<string>? errorMessage = null)
         {
-            string lockValue = null;
+            string? lockValue = null;
             try
             {
-                lockValue = lockKey == null ? _storage.LockWithWait() : _storage.LockWithWait(lockKey);
-                return fun.Invoke();
+                lockValue = await _storage.LockWithWaitAsync(_storeSchema.LockKey).ConfigureAwait(false);
+                return await fun().ConfigureAwait(false);
             }
             catch (ObjectAlreadyExistsException)
             {
@@ -624,81 +633,31 @@ namespace QuartzRedis.Store
             }
             catch (Exception ex)
             {
-                throw new JobPersistenceException(errorMessage, ex);
+                throw new JobPersistenceException(errorMessage != null ? errorMessage() : "Job Storage error", ex);
             }
             finally
             {
                 if (lockValue != null)
                 {
-                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
+                    await _storage.UnlockAsync(_storeSchema.LockKey, lockValue).ConfigureAwait(false);
                 }
             }
         }
 
         /// <summary>
-        /// async counterpart to <see cref="DoWithLock{T}"/> - waits for the lock via
-        /// <see cref="BaseJobStorage.LockWithWaitAsync"/> instead of the blocking, thread-pool-consuming
-        /// <see cref="BaseJobStorage.LockWithWait(string)"/>. Use for lock-critical sections that can be
-        /// contended under load (e.g. trigger acquisition), so waiting callers don't tie up worker threads.
+        /// <see cref="DoWithLockAsync{T}"/> for actions with no return value. Delegates to the same
+        /// implementation so both share identical exception semantics - in particular, both correctly
+        /// rethrow <see cref="ObjectAlreadyExistsException"/> instead of silently swallowing it.
         /// </summary>
-        /// <typeparam name="T">return type of the Function</typeparam>
-        /// <param name="fun">Fuction</param>
-        /// <param name="errorMessage">error message used to override the default one</param>
-        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.</param>
-        private async Task<T> DoWithLockAsync<T>(Func<T> fun, string errorMessage = "Job Storage error", string lockKey = null)
+        /// <param name="action">the async action to run under the lock</param>
+        /// <param name="errorMessage">lazily-evaluated error message, built only if an exception is actually thrown</param>
+        private Task DoWithLockAsync(Func<Task> action, Func<string>? errorMessage = null)
         {
-            string lockValue = null;
-            try
+            return DoWithLockAsync(async () =>
             {
-                lockValue = await _storage.LockWithWaitAsync(lockKey ?? _storeSchema.LockKey).ConfigureAwait(false);
-                return fun.Invoke();
-            }
-            catch (ObjectAlreadyExistsException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                throw new JobPersistenceException(errorMessage, ex);
-            }
-            finally
-            {
-                if (lockValue != null)
-                {
-                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
-                }
-            }
-        }
-
-        /// <summary>
-        /// crud opertion to redis with lock
-        /// </summary>
-        /// <param name="action">Action</param>
-        /// <param name="errorMessage">error message used to override the default one</param>
-        /// <param name="lockKey">the redis key backing the lock to take; defaults to the main store lock.</param>
-        private void DoWithLock(Action action, string errorMessage = "Job Storage error", string lockKey = null)
-        {
-            string lockValue = null;
-            try
-            {
-                lockValue = lockKey == null ? _storage.LockWithWait() : _storage.LockWithWait(lockKey);
-                action.Invoke();
-            }
-            catch (ObjectAlreadyExistsException ex)
-            {
-                _logger.Error("key exists", ex);
-            }
-            catch (Exception ex)
-            {
-                throw new JobPersistenceException(errorMessage, ex);
-            }
-            finally
-            {
-                if (lockValue != null)
-                {
-                    _storage.Unlock(lockKey ?? _storeSchema.LockKey, lockValue);
-                }
-            }
+                await action().ConfigureAwait(false);
+                return true;
+            }, errorMessage);
         }
 
         #endregion
