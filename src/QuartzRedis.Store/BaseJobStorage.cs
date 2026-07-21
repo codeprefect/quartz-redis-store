@@ -1317,6 +1317,12 @@ namespace QuartzRedis.Store
             // overload from TriggerDataMapHashKey - there is no separate per-trigger-type job data map to read here.
         }
 
+        // DateTimeOffset.MaxValue/MinValue round-tripped through double milliseconds can round past
+        // the actual DateTime boundary (double precision at this magnitude is ~0.03-0.06ms), so these
+        // bounds are nudged inward to stay safely within the valid DateTime range.
+        private static readonly double MinUnixMillis = Math.Ceiling((DateTime.MinValue.Ticks - UnixEpoch.Ticks) / (double)TimeSpan.TicksPerMillisecond);
+        private static readonly double MaxUnixMillis = Math.Floor((DateTime.MaxValue.Ticks - UnixEpoch.Ticks) / (double)TimeSpan.TicksPerMillisecond);
+
         /// <summary>
         /// convert to utc datetime
         /// </summary>
@@ -1324,7 +1330,8 @@ namespace QuartzRedis.Store
         /// <returns>datetime in utc</returns>
         private static DateTime DateTimeFromUnixTimestampMillis(double millis)
         {
-            return UnixEpoch.AddMilliseconds(millis);
+            var clampedMillis = Math.Min(Math.Max(millis, MinUnixMillis), MaxUnixMillis);
+            return UnixEpoch.AddMilliseconds(clampedMillis);
         }
 
         /// <summary>
